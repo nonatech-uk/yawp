@@ -23,11 +23,29 @@ class YAWP_S3 {
     }
 
     private function host() {
-        return $this->bucket . '.s3.' . $this->region . '.amazonaws.com';
+        return 's3.' . $this->region . '.amazonaws.com';
     }
 
-    private function base_url() {
-        return 'https://' . $this->host();
+    /**
+     * Build the full URL for an object key (path-style).
+     */
+    private function url( $key = '' ) {
+        $url = 'https://' . $this->host() . '/' . $this->bucket;
+        if ( '' !== $key ) {
+            $url .= '/' . $this->encode_key( $key );
+        }
+        return $url;
+    }
+
+    /**
+     * Build the canonical path for signing (path-style).
+     */
+    private function path( $key = '' ) {
+        $p = '/' . $this->bucket;
+        if ( '' !== $key ) {
+            $p .= '/' . $this->encode_key( $key );
+        }
+        return $p;
     }
 
     /**
@@ -48,24 +66,23 @@ class YAWP_S3 {
         $size     = filesize( $file_path );
         $sha256   = hash_file( 'sha256', $file_path );
         $retain   = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
-        $url      = $this->base_url() . '/' . $this->encode_key( $key );
 
         $headers = [
-            'Content-Length'                    => $size,
-            'Content-Type'                      => 'application/gzip',
-            'x-amz-content-sha256'              => $sha256,
-            'x-amz-object-lock-mode'            => 'COMPLIANCE',
-            'x-amz-object-lock-retain-until-date' => $retain,
+            'Content-Length'                       => $size,
+            'Content-Type'                         => 'application/gzip',
+            'x-amz-content-sha256'                 => $sha256,
+            'x-amz-object-lock-mode'               => 'COMPLIANCE',
+            'x-amz-object-lock-retain-until-date'  => $retain,
         ];
 
-        $signed = $this->sign_request( 'PUT', '/' . $this->encode_key( $key ), $headers, $sha256 );
+        $signed = $this->sign_request( 'PUT', $this->path( $key ), $headers, $sha256 );
 
         $fh = fopen( $file_path, 'rb' );
         if ( ! $fh ) {
             return new WP_Error( 'yawp_s3', 'Cannot open file for upload.' );
         }
 
-        $ch = curl_init( $url );
+        $ch = curl_init( $this->url( $key ) );
         curl_setopt_array( $ch, [
             CURLOPT_PUT            => true,
             CURLOPT_INFILE         => $fh,
@@ -135,14 +152,14 @@ class YAWP_S3 {
 
     private function initiate_multipart( $key, $retention_days ) {
         $retain = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
-        $path   = '/' . $this->encode_key( $key ) . '?uploads';
-        $url    = $this->base_url() . '/' . $this->encode_key( $key ) . '?uploads';
+        $path   = $this->path( $key ) . '?uploads';
+        $url    = $this->url( $key ) . '?uploads';
 
         $headers = [
-            'Content-Type'                        => 'application/gzip',
-            'x-amz-content-sha256'                => hash( 'sha256', '' ),
-            'x-amz-object-lock-mode'              => 'COMPLIANCE',
-            'x-amz-object-lock-retain-until-date' => $retain,
+            'Content-Type'                         => 'application/gzip',
+            'x-amz-content-sha256'                 => hash( 'sha256', '' ),
+            'x-amz-object-lock-mode'               => 'COMPLIANCE',
+            'x-amz-object-lock-retain-until-date'  => $retain,
         ];
 
         $signed = $this->sign_request( 'POST', $path, $headers, hash( 'sha256', '' ) );
@@ -176,8 +193,9 @@ class YAWP_S3 {
 
     private function upload_part( $key, $upload_id, $part_number, $data ) {
         $sha256 = hash( 'sha256', $data );
-        $path   = '/' . $this->encode_key( $key ) . '?partNumber=' . $part_number . '&uploadId=' . urlencode( $upload_id );
-        $url    = $this->base_url() . '/' . $this->encode_key( $key ) . '?partNumber=' . $part_number . '&uploadId=' . urlencode( $upload_id );
+        $qs     = 'partNumber=' . $part_number . '&uploadId=' . urlencode( $upload_id );
+        $path   = $this->path( $key ) . '?' . $qs;
+        $url    = $this->url( $key ) . '?' . $qs;
 
         $headers = [
             'Content-Length'       => strlen( $data ),
@@ -225,8 +243,9 @@ class YAWP_S3 {
         $xml .= '</CompleteMultipartUpload>';
 
         $sha256 = hash( 'sha256', $xml );
-        $path   = '/' . $this->encode_key( $key ) . '?uploadId=' . urlencode( $upload_id );
-        $url    = $this->base_url() . '/' . $this->encode_key( $key ) . '?uploadId=' . urlencode( $upload_id );
+        $qs     = 'uploadId=' . urlencode( $upload_id );
+        $path   = $this->path( $key ) . '?' . $qs;
+        $url    = $this->url( $key ) . '?' . $qs;
 
         $headers = [
             'Content-Length'       => strlen( $xml ),
@@ -260,8 +279,9 @@ class YAWP_S3 {
     }
 
     private function abort_multipart( $key, $upload_id ) {
-        $path = '/' . $this->encode_key( $key ) . '?uploadId=' . urlencode( $upload_id );
-        $url  = $this->base_url() . '/' . $this->encode_key( $key ) . '?uploadId=' . urlencode( $upload_id );
+        $qs   = 'uploadId=' . urlencode( $upload_id );
+        $path = $this->path( $key ) . '?' . $qs;
+        $url  = $this->url( $key ) . '?' . $qs;
 
         $headers = [
             'x-amz-content-sha256' => hash( 'sha256', '' ),
@@ -281,29 +301,30 @@ class YAWP_S3 {
     }
 
     /**
-     * Test connection by issuing a HEAD request on the bucket.
+     * Test connection with a minimal ListObjectsV2 (GET) — returns the real S3 error on failure.
      */
     public function test_connection() {
-        $path = '/';
-        $url  = $this->base_url() . '/';
+        $qs   = 'list-type=2&max-keys=1';
+        $path = $this->path() . '?' . $qs;
+        $url  = $this->url() . '?' . $qs;
 
         $headers = [
             'x-amz-content-sha256' => hash( 'sha256', '' ),
         ];
 
-        $signed = $this->sign_request( 'HEAD', $path, $headers, hash( 'sha256', '' ) );
+        $signed = $this->sign_request( 'GET', $path, $headers, hash( 'sha256', '' ) );
 
         $ch = curl_init( $url );
         curl_setopt_array( $ch, [
-            CURLOPT_NOBODY         => true,
+            CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $this->format_headers( $signed ),
             CURLOPT_TIMEOUT        => 15,
         ]);
 
-        curl_exec( $ch );
-        $code  = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
-        $error = curl_error( $ch );
+        $response = curl_exec( $ch );
+        $code     = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+        $error    = curl_error( $ch );
         curl_close( $ch );
 
         if ( $error ) {
@@ -312,24 +333,14 @@ class YAWP_S3 {
         if ( $code === 200 ) {
             return true;
         }
-        if ( $code === 301 ) {
-            return new WP_Error( 'yawp_s3', 'Bucket region mismatch — check your region setting.' );
-        }
-        if ( $code === 403 ) {
-            return new WP_Error( 'yawp_s3', 'Access denied — check your credentials.' );
-        }
-        if ( $code === 404 ) {
-            return new WP_Error( 'yawp_s3', 'Bucket not found.' );
-        }
-        return new WP_Error( 'yawp_s3', "Unexpected HTTP {$code} from S3." );
+        return new WP_Error( 'yawp_s3', "S3 returned HTTP {$code}: " . $this->parse_s3_error( $response ) );
     }
 
     /**
-     * Upload a JSON manifest string.
+     * Upload a JSON manifest string (no Object Lock — manifest is overwritten each run).
      */
     public function put_json( $key, $json_string ) {
         $sha256 = hash( 'sha256', $json_string );
-        $url    = $this->base_url() . '/' . $this->encode_key( $key );
 
         $headers = [
             'Content-Length'       => strlen( $json_string ),
@@ -337,9 +348,9 @@ class YAWP_S3 {
             'x-amz-content-sha256' => $sha256,
         ];
 
-        $signed = $this->sign_request( 'PUT', '/' . $this->encode_key( $key ), $headers, $sha256 );
+        $signed = $this->sign_request( 'PUT', $this->path( $key ), $headers, $sha256 );
 
-        $ch = curl_init( $url );
+        $ch = curl_init( $this->url( $key ) );
         curl_setopt_array( $ch, [
             CURLOPT_CUSTOMREQUEST  => 'PUT',
             CURLOPT_POSTFIELDS     => $json_string,
@@ -370,14 +381,14 @@ class YAWP_S3 {
      * Sign a request and return all headers (original + auth).
      */
     private function sign_request( $method, $path, $headers, $payload_hash ) {
-        $now       = gmdate( 'Ymd\THis\Z' );
+        $now        = gmdate( 'Ymd\THis\Z' );
         $date_short = gmdate( 'Ymd' );
 
         $headers['Host']       = $this->host();
         $headers['x-amz-date'] = $now;
 
         // Separate path and query string.
-        $parts = explode( '?', $path, 2 );
+        $parts         = explode( '?', $path, 2 );
         $canonical_uri = $parts[0];
         $query_string  = isset( $parts[1] ) ? $parts[1] : '';
 
@@ -396,11 +407,11 @@ class YAWP_S3 {
         }
 
         // Canonical headers: sorted by lowercase key.
-        $canonical_headers = [];
+        $canonical_headers   = [];
         $signed_header_names = [];
         foreach ( $headers as $k => $v ) {
             $lk = strtolower( $k );
-            $canonical_headers[ $lk ] = $lk . ':' . trim( $v );
+            $canonical_headers[ $lk ]   = $lk . ':' . trim( $v );
             $signed_header_names[ $lk ] = true;
         }
         ksort( $canonical_headers );
