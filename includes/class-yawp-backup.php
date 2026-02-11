@@ -260,7 +260,7 @@ TXT;
     }
 
     private function build_tar_command( $type, $archive, $tmp_dir ) {
-        $webroot = '/var/www/html';
+        $webroot = rtrim( get_option( 'yawp_webroot', '/var/www/html' ), '/' );
         $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp --exclude=.git --exclude=.claude';
 
         if ( 'incremental' === $type ) {

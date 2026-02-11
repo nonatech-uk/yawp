@@ -40,6 +40,7 @@ class YAWP_Admin {
             'yawp_s3_region'            => 'sanitize_text_field',
             'yawp_s3_bucket'            => 'sanitize_text_field',
             'yawp_s3_prefix'            => 'sanitize_text_field',
+            'yawp_webroot'              => 'sanitize_text_field',
             'yawp_full_backup_interval' => 'absint',
             'yawp_healthchecks_url'     => 'esc_url_raw',
         ];
@@ -259,6 +260,12 @@ class YAWP_Admin {
                         <td><input type="text" id="yawp_s3_prefix" name="yawp_s3_prefix"
                             value="<?php echo esc_attr( get_option( 'yawp_s3_prefix' ) ); ?>" class="regular-text" />
                             <p class="description">e.g. <code>pitstop</code> — no leading/trailing slashes.</p></td>
+                    </tr>
+                    <tr>
+                        <th><label for="yawp_webroot">WordPress Root Path</label></th>
+                        <td><input type="text" id="yawp_webroot" name="yawp_webroot"
+                            value="<?php echo esc_attr( get_option( 'yawp_webroot', '/var/www/html' ) ); ?>" class="regular-text" />
+                            <p class="description">Absolute path to the WordPress installation. Default: <code>/var/www/html</code></p></td>
                     </tr>
                     <tr>
                         <th><label for="yawp_full_backup_interval">Full backup every X days</label></th>
