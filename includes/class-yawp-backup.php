@@ -84,7 +84,8 @@ class YAWP_Backup {
             $output  = [];
             $retval  = 0;
             exec( $tar_cmd . ' 2>&1', $output, $retval );
-            if ( $retval !== 0 ) {
+            // Exit 1 = "file changed as we read it" — normal on a live site.
+            if ( $retval > 1 ) {
                 return $this->fail( 'tar failed (exit ' . $retval . '): ' . implode( "\n", $output ) );
             }
 
@@ -323,21 +324,22 @@ TXT;
     }
 
     private function healthcheck( $event, $log = '' ) {
-        $url = get_option( 'yawp_healthchecks_url', '' );
-        if ( empty( $url ) ) {
+        $base = rtrim( get_option( 'yawp_healthchecks_url', '' ), '/' );
+        if ( empty( $base ) ) {
             return;
         }
 
-        $body = wp_json_encode( [
-            'event'     => $event,
-            'timestamp' => gmdate( 'Y-m-d\TH:i:s\Z' ),
-            'site'      => get_option( 'siteurl' ),
-            'log'       => substr( $log, -10000 ),
-        ] );
+        // Healthchecks.io convention: /start, /fail, or bare URL for success.
+        $suffix = '';
+        if ( 'start' === $event ) {
+            $suffix = '/start';
+        } elseif ( 'fail' === $event ) {
+            $suffix = '/fail';
+        }
 
-        wp_remote_post( $url, [
-            'body'    => $body,
-            'headers' => [ 'Content-Type' => 'application/json' ],
+        wp_remote_post( $base . $suffix, [
+            'body'    => substr( $log, -10000 ),
+            'headers' => [ 'Content-Type' => 'text/plain' ],
             'timeout' => 10,
         ] );
     }
