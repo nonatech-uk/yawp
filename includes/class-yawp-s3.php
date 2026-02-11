@@ -378,6 +378,130 @@ class YAWP_S3 {
     }
 
     // ──────────────────────────────────────────────
+    // List & Download
+    // ──────────────────────────────────────────────
+
+    /**
+     * List objects under a prefix (ListObjectsV2), paginating automatically.
+     *
+     * @param string $prefix S3 key prefix to filter by.
+     * @return array|WP_Error Array of [ 'Key' => …, 'Size' => …, 'LastModified' => … ].
+     */
+    public function list_objects( $prefix = '' ) {
+        $all_objects        = [];
+        $continuation_token = '';
+
+        do {
+            $qs = 'list-type=2&prefix=' . rawurlencode( $prefix );
+            if ( '' !== $continuation_token ) {
+                $qs .= '&continuation-token=' . rawurlencode( $continuation_token );
+            }
+
+            $path = $this->path() . '?' . $qs;
+            $url  = $this->url() . '?' . $qs;
+
+            $headers = [
+                'x-amz-content-sha256' => hash( 'sha256', '' ),
+            ];
+
+            $signed = $this->sign_request( 'GET', $path, $headers, hash( 'sha256', '' ) );
+
+            $ch = curl_init( $url );
+            curl_setopt_array( $ch, [
+                CURLOPT_HTTPGET        => true,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER     => $this->format_headers( $signed ),
+                CURLOPT_TIMEOUT        => 30,
+            ] );
+
+            $response = curl_exec( $ch );
+            $code     = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+            $error    = curl_error( $ch );
+            curl_close( $ch );
+
+            if ( $error ) {
+                return new WP_Error( 'yawp_s3', 'cURL error listing objects: ' . $error );
+            }
+            if ( $code < 200 || $code >= 300 ) {
+                return new WP_Error( 'yawp_s3', "S3 ListObjectsV2 failed (HTTP {$code}): " . $this->parse_s3_error( $response ) );
+            }
+
+            // Parse <Contents> entries.
+            if ( preg_match_all( '/<Contents>(.*?)<\/Contents>/s', $response, $matches ) ) {
+                foreach ( $matches[1] as $block ) {
+                    $key  = preg_match( '/<Key>(.+?)<\/Key>/', $block, $m ) ? $m[1] : '';
+                    $size = preg_match( '/<Size>(.+?)<\/Size>/', $block, $m ) ? (int) $m[1] : 0;
+                    $date = preg_match( '/<LastModified>(.+?)<\/LastModified>/', $block, $m ) ? $m[1] : '';
+
+                    if ( '' !== $key ) {
+                        $all_objects[] = [
+                            'Key'          => $key,
+                            'Size'         => $size,
+                            'LastModified' => $date,
+                        ];
+                    }
+                }
+            }
+
+            // Check for pagination.
+            $continuation_token = '';
+            if ( preg_match( '/<NextContinuationToken>(.+?)<\/NextContinuationToken>/', $response, $m ) ) {
+                $continuation_token = $m[1];
+            }
+        } while ( '' !== $continuation_token );
+
+        return $all_objects;
+    }
+
+    /**
+     * Download an S3 object to a local file path (streaming via cURL).
+     *
+     * @param string $key        S3 object key.
+     * @param string $local_path Absolute local file path to write to.
+     * @return true|WP_Error
+     */
+    public function get_object( $key, $local_path ) {
+        $headers = [
+            'x-amz-content-sha256' => hash( 'sha256', '' ),
+        ];
+
+        $signed = $this->sign_request( 'GET', $this->path( $key ), $headers, hash( 'sha256', '' ) );
+
+        $fh = fopen( $local_path, 'wb' );
+        if ( ! $fh ) {
+            return new WP_Error( 'yawp_s3', 'Cannot open local file for writing: ' . $local_path );
+        }
+
+        $ch = curl_init( $this->url( $key ) );
+        curl_setopt_array( $ch, [
+            CURLOPT_HTTPGET    => true,
+            CURLOPT_FILE       => $fh,
+            CURLOPT_HTTPHEADER => $this->format_headers( $signed ),
+            CURLOPT_TIMEOUT    => 1800, // 30 minutes for large archives.
+        ] );
+
+        curl_exec( $ch );
+        $code  = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+        $error = curl_error( $ch );
+        curl_close( $ch );
+        fclose( $fh );
+
+        if ( $error ) {
+            @unlink( $local_path );
+            return new WP_Error( 'yawp_s3', 'cURL error downloading object: ' . $error );
+        }
+
+        if ( $code < 200 || $code >= 300 ) {
+            // On HTTP error the file contains the S3 XML error body — read it back.
+            $body = @file_get_contents( $local_path );
+            @unlink( $local_path );
+            return new WP_Error( 'yawp_s3', "S3 GET failed (HTTP {$code}): " . $this->parse_s3_error( $body ? $body : '' ) );
+        }
+
+        return true;
+    }
+
+    // ──────────────────────────────────────────────
     // SigV4 signing
     // ──────────────────────────────────────────────
 

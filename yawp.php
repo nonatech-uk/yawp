@@ -22,6 +22,7 @@ define( 'YAWP_GITHUB_REPO', 'nonatech-uk/yawp' );
 require_once YAWP_PATH . 'includes/class-yawp-s3.php';
 require_once YAWP_PATH . 'includes/class-yawp-db-export.php';
 require_once YAWP_PATH . 'includes/class-yawp-backup.php';
+require_once YAWP_PATH . 'includes/class-yawp-restore.php';
 require_once YAWP_PATH . 'includes/class-yawp-admin.php';
 require_once YAWP_PATH . 'includes/class-yawp-login.php';
 require_once YAWP_PATH . 'includes/class-yawp-scheduler.php';

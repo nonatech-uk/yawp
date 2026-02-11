@@ -12,6 +12,8 @@ class YAWP_Admin {
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
         add_action( 'wp_ajax_yawp_test_connection', [ $this, 'ajax_test_connection' ] );
         add_action( 'wp_ajax_yawp_run_backup', [ $this, 'ajax_run_backup' ] );
+        add_action( 'wp_ajax_yawp_list_backups', [ $this, 'ajax_list_backups' ] );
+        add_action( 'wp_ajax_yawp_restore_backup', [ $this, 'ajax_restore_backup' ] );
     }
 
     public function add_menu() {
@@ -119,6 +121,52 @@ class YAWP_Admin {
             wp_send_json_error( $result->get_error_message() );
         }
         wp_send_json_success( ucfirst( $type ) . ' backup completed.' );
+    }
+
+    public function ajax_list_backups() {
+        check_ajax_referer( 'yawp_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Unauthorized.' );
+        }
+
+        $s3 = $this->get_s3_from_options();
+        if ( is_wp_error( $s3 ) ) {
+            wp_send_json_error( $s3->get_error_message() );
+        }
+
+        $restore = new YAWP_Restore( $s3 );
+        $backups = $restore->list_backups();
+        if ( is_wp_error( $backups ) ) {
+            wp_send_json_error( $backups->get_error_message() );
+        }
+        wp_send_json_success( $backups );
+    }
+
+    public function ajax_restore_backup() {
+        check_ajax_referer( 'yawp_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Unauthorized.' );
+        }
+
+        $s3_key  = isset( $_POST['s3_key'] ) ? sanitize_text_field( $_POST['s3_key'] ) : '';
+        $new_url = isset( $_POST['new_url'] ) ? sanitize_text_field( $_POST['new_url'] ) : '';
+        $new_url = rtrim( trim( $new_url ), '/' );
+
+        if ( '' === $s3_key ) {
+            wp_send_json_error( 'No backup key specified.' );
+        }
+
+        $s3 = $this->get_s3_from_options();
+        if ( is_wp_error( $s3 ) ) {
+            wp_send_json_error( $s3->get_error_message() );
+        }
+
+        $restore = new YAWP_Restore( $s3 );
+        $result  = $restore->restore( $s3_key, $new_url );
+        if ( is_wp_error( $result ) ) {
+            wp_send_json_error( $result->get_error_message() );
+        }
+        wp_send_json_success( 'Restore completed successfully.' );
     }
 
     private function get_s3_from_options() {
@@ -259,6 +307,24 @@ class YAWP_Admin {
                 </tbody>
             </table>
             <?php endif; ?>
+
+            <div class="yawp-restore-section">
+                <h2>Restore</h2>
+                <p class="description">Restore a backup from S3. This will overwrite the database and files on this site.</p>
+                <table class="form-table">
+                    <tr>
+                        <th><label for="yawp-restore-new-url">New Site URL</label></th>
+                        <td><input type="text" id="yawp-restore-new-url" class="regular-text"
+                            placeholder="Leave blank to keep original URL" />
+                            <p class="description">If restoring to a different domain, enter the full URL (e.g. <code>https://staging.example.com</code>).</p></td>
+                    </tr>
+                </table>
+                <div class="yawp-actions">
+                    <button class="button" id="yawp-list-backups">List Available Backups</button>
+                    <span id="yawp-restore-status"></span>
+                </div>
+                <div id="yawp-restore-list"></div>
+            </div>
         </div>
 
         <script>
@@ -302,6 +368,111 @@ class YAWP_Admin {
 
             $('#yawp-run-full').on('click', runBackup('full'));
             $('#yawp-run-incremental').on('click', runBackup('incremental'));
+
+            // ── Restore ──
+
+            var $restoreStatus = $('#yawp-restore-status');
+            var $restoreList   = $('#yawp-restore-list');
+
+            function setRestoreStatus(msg, isError) {
+                $restoreStatus.text(msg).css('color', isError ? '#d63638' : '#00a32a');
+            }
+
+            function escHtml(s) {
+                var d = document.createElement('div');
+                d.appendChild(document.createTextNode(s));
+                return d.innerHTML;
+            }
+
+            function escAttr(s) {
+                return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            }
+
+            function formatSize(bytes) {
+                if (!bytes || bytes === 0) return '—';
+                var units = ['B','KB','MB','GB'];
+                var i = 0;
+                var b = bytes;
+                while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+                return b.toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
+            }
+
+            $('#yawp-list-backups').on('click', function(e) {
+                e.preventDefault();
+                var $btn = $(this).prop('disabled', true);
+                setRestoreStatus('Loading backups...', false);
+                $restoreList.empty();
+                $.post(ajaxurl, { action: 'yawp_list_backups', nonce: nonce }, function(resp) {
+                    $btn.prop('disabled', false);
+                    if (!resp.success) {
+                        setRestoreStatus(resp.data, true);
+                        return;
+                    }
+                    setRestoreStatus('', false);
+                    var backups = resp.data;
+                    if (!backups.length) {
+                        $restoreList.html('<p>No backups found.</p>');
+                        return;
+                    }
+                    var html = '<table class="widefat yawp-restore-table"><thead><tr>' +
+                        '<th>Date</th><th>Type</th><th>Size</th><th>S3 Key</th><th></th>' +
+                        '</tr></thead><tbody>';
+                    for (var i = 0; i < backups.length; i++) {
+                        var b = backups[i];
+                        html += '<tr>' +
+                            '<td>' + escHtml(b.date) + '</td>' +
+                            '<td>' + escHtml(b.type) + '</td>' +
+                            '<td>' + formatSize(b.size) + '</td>' +
+                            '<td><code>' + escHtml(b.s3_key) + '</code></td>' +
+                            '<td><button class="button yawp-restore-btn" data-key="' + escAttr(b.s3_key) + '">Restore</button></td>' +
+                            '</tr>';
+                    }
+                    html += '</tbody></table>';
+                    $restoreList.html(html);
+                }).fail(function() {
+                    setRestoreStatus('Request failed.', true);
+                    $btn.prop('disabled', false);
+                });
+            });
+
+            $restoreList.on('click', '.yawp-restore-btn', function(e) {
+                e.preventDefault();
+                var key    = $(this).data('key');
+                var newUrl = $.trim($('#yawp-restore-new-url').val());
+
+                var msg = 'WARNING: This will overwrite the database and files on this site.\n\n' +
+                    'Backup: ' + key + '\n';
+                if (newUrl) {
+                    msg += 'New URL: ' + newUrl + '\n';
+                }
+                msg += '\nYour session will be invalidated and you will need to log in again.\n\nContinue?';
+
+                if (!confirm(msg)) return;
+
+                // Disable all restore buttons.
+                $restoreList.find('.yawp-restore-btn').prop('disabled', true);
+                setRestoreStatus('Restoring... this may take several minutes.', false);
+
+                $.post(ajaxurl, {
+                    action:  'yawp_restore_backup',
+                    nonce:   nonce,
+                    s3_key:  key,
+                    new_url: newUrl
+                }, function(resp) {
+                    if (resp.success) {
+                        var loginUrl = (newUrl || '') + '/wp-login.php';
+                        if (!newUrl) loginUrl = '/wp-login.php';
+                        setRestoreStatus('Restore complete! Redirecting to login...', false);
+                        setTimeout(function() { window.location.href = loginUrl; }, 3000);
+                    } else {
+                        setRestoreStatus(resp.data, true);
+                        $restoreList.find('.yawp-restore-btn').prop('disabled', false);
+                    }
+                }).fail(function() {
+                    setRestoreStatus('Request failed.', true);
+                    $restoreList.find('.yawp-restore-btn').prop('disabled', false);
+                });
+            });
         });
         </script>
         <?php
