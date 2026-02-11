@@ -8,7 +8,7 @@ class YAWP_Updater {
 
     private $plugin_slug = 'yawp/yawp.php';
     private $cache_key   = 'yawp_github_release';
-    private $cache_ttl   = 43200; // 12 hours
+    private $cache_ttl   = 3600; // 1 hour
 
     public function __construct() {
         add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'check_update' ] );
@@ -24,6 +24,8 @@ class YAWP_Updater {
             return $transient;
         }
 
+        // Clear our cache so we always get the latest from GitHub.
+        delete_transient( $this->cache_key );
         $release = $this->get_latest_release();
         if ( ! $release ) {
             return $transient;
