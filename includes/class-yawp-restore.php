@@ -486,17 +486,31 @@ class YAWP_Restore {
                     continue;
                 }
 
+                // Build UPDATE query manually. We must bypass $wpdb->prepare()
+                // because it corrupts % characters (e.g. "width: 100%" in CSS
+                // or Gutenberg block attributes) via its placeholder escaping.
+                // Use _real_escape for SQL injection safety, then strip the
+                // WordPress placeholder escape hash to get clean escaped values.
+                $set_parts = [];
+                foreach ( $updates as $col => $val ) {
+                    $escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $val ) );
+                    $set_parts[] = "`{$col}` = '{$escaped}'";
+                }
+                $set_sql = implode( ', ', $set_parts );
+
                 if ( $pk_col && isset( $row[ $pk_col ] ) ) {
-                    $wpdb->update( $table, $updates, [ $pk_col => $row[ $pk_col ] ] );
+                    $pk_escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $row[ $pk_col ] ) );
+                    $wpdb->query( "UPDATE `{$table}` SET {$set_sql} WHERE `{$pk_col}` = '{$pk_escaped}'" );
                 } else {
                     // Fallback: update by matching old column values.
-                    $where_row = [];
+                    $where_parts_row = [];
                     foreach ( $text_columns as $col ) {
                         if ( isset( $row[ $col ] ) ) {
-                            $where_row[ $col ] = $row[ $col ];
+                            $escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $row[ $col ] ) );
+                            $where_parts_row[] = "`{$col}` = '{$escaped}'";
                         }
                     }
-                    $wpdb->update( $table, $updates, $where_row );
+                    $wpdb->query( "UPDATE `{$table}` SET {$set_sql} WHERE " . implode( ' AND ', $where_parts_row ) );
                 }
             }
 
