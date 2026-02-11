@@ -1,0 +1,48 @@
+/* YAWP Admin Styles */
+
+.yawp-status-box {
+    background: #fff;
+    border: 1px solid #c3c4c7;
+    border-left: 4px solid #2271b1;
+    padding: 1px 12px;
+    margin: 15px 0;
+}
+
+.yawp-status-table th {
+    width: 180px;
+    padding: 8px 10px;
+}
+
+.yawp-status-table td {
+    padding: 8px 10px;
+}
+
+.yawp-error {
+    color: #d63638;
+    font-weight: 600;
+}
+
+.yawp-actions {
+    margin: 15px 0 25px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#yawp-action-status {
+    margin-left: 8px;
+    font-weight: 600;
+}
+
+.yawp-history-table {
+    margin-top: 10px;
+}
+
+.yawp-history-table code {
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.yawp-row-error {
+    background-color: #fcf0f1;
+}
