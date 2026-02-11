@@ -191,6 +191,11 @@ class YAWP_Restore {
                 return $import_result;
             }
 
+            // ── Fix legacy backups where $wpdb->_real_escape() baked
+            //    WordPress placeholder hashes into the SQL dump (% → {hash}).
+            //    Scan for any {64-char-hex} patterns and replace with %. ──
+            $this->fix_placeholder_hashes();
+
             // ── Re-apply saved YAWP settings ──
             foreach ( $saved_options as $name => $value ) {
                 update_option( $name, $value, false );
@@ -423,6 +428,48 @@ class YAWP_Restore {
     /**
      * Open a raw mysqli connection using WordPress DB constants.
      */
+    /**
+     * Fix legacy backups where $wpdb->_real_escape() wrote WordPress
+     * placeholder escape hashes into the SQL dump. These are {64-hex-char}
+     * strings that should be literal % characters.
+     */
+    private function fix_placeholder_hashes() {
+        $dbh = $this->get_raw_dbh();
+        if ( ! $dbh ) {
+            return;
+        }
+
+        $tables_result = mysqli_query( $dbh, 'SHOW TABLES' );
+        while ( $row = mysqli_fetch_row( $tables_result ) ) {
+            $table = $row[0];
+
+            $cols_result = mysqli_query( $dbh, "SHOW COLUMNS FROM `{$table}`" );
+            while ( $col = mysqli_fetch_assoc( $cols_result ) ) {
+                if ( ! preg_match( '/varchar|text|longtext|mediumtext/i', $col['Type'] ) ) {
+                    continue;
+                }
+                $field = $col['Field'];
+
+                // Match {64-hex-char} which is WordPress's placeholder pattern.
+                // Use REGEXP to find rows, then REPLACE the specific hash.
+                $search = mysqli_query( $dbh,
+                    "SELECT DISTINCT SUBSTRING(`{$field}`, LOCATE('{', `{$field}`), 66) AS hash_str " .
+                    "FROM `{$table}` WHERE `{$field}` REGEXP '\\\\{[0-9a-f]{64}\\\\}' LIMIT 1"
+                );
+
+                if ( $search && $found = mysqli_fetch_assoc( $search ) ) {
+                    $hash = mysqli_real_escape_string( $dbh, $found['hash_str'] );
+                    mysqli_query( $dbh,
+                        "UPDATE `{$table}` SET `{$field}` = REPLACE(`{$field}`, '{$hash}', '%') " .
+                        "WHERE `{$field}` LIKE '%{$hash}%'"
+                    );
+                }
+            }
+        }
+
+        mysqli_close( $dbh );
+    }
+
     private function get_raw_dbh() {
         $host = DB_HOST;
         $port = 3306;
