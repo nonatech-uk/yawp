@@ -116,7 +116,7 @@ class YAWP_Restore {
             }
 
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = '--exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php';
+            $tar_excludes = '--overwrite --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude=.claude --exclude=*/.git --exclude=./.git';
 
             // ── Build the chain of archives to extract files from ──
             // For an incremental: full → each incremental up to and including
@@ -144,7 +144,9 @@ class YAWP_Restore {
                     $tar_excludes
                 );
                 exec( $cmd, $output, $exit_code );
-                if ( 0 !== $exit_code ) {
+                // Exit code 1 = non-fatal warnings (permission denied on
+                // read-only .git objects, etc). Only fail on exit code 2+.
+                if ( $exit_code >= 2 ) {
                     return new WP_Error( 'yawp_restore', 'Failed to extract files from ' . basename( $chain_key ) . ': ' . implode( "\n", $output ) );
                 }
 
@@ -337,12 +339,13 @@ class YAWP_Restore {
     }
 
     // ──────────────────────────────────────────────
-    // URL rewrite (serialization-safe)
+    // URL rewrite
     // ──────────────────────────────────────────────
 
     /**
-     * Replace all occurrences of $old_url with $new_url across the entire database,
-     * handling serialized PHP data correctly.
+     * Replace all occurrences of $old_url with $new_url across the entire
+     * database using straight SQL REPLACE(). Simple and avoids WordPress's
+     * $wpdb placeholder escaping which corrupts % characters.
      *
      * @param string $old_url The original site URL.
      * @param string $new_url The new site URL.
@@ -351,7 +354,6 @@ class YAWP_Restore {
     public function rewrite_urls( $old_url, $new_url ) {
         global $wpdb;
 
-        // Normalize — strip trailing slashes.
         $old_url = rtrim( $old_url, '/' );
         $new_url = rtrim( $new_url, '/' );
 
@@ -359,215 +361,81 @@ class YAWP_Restore {
             return true;
         }
 
-        // Update siteurl and home directly.
-        $wpdb->update( $wpdb->options, [ 'option_value' => $new_url ], [ 'option_name' => 'siteurl' ] );
-        $wpdb->update( $wpdb->options, [ 'option_value' => $new_url ], [ 'option_name' => 'home' ] );
+        // Build search/replace pairs: exact, opposite scheme, schemeless.
+        $pairs = [ [ $old_url, $new_url ] ];
 
-        // Build search/replace pairs including scheme variants.
-        $replacements = $this->build_replacement_pairs( $old_url, $new_url );
-
-        // Iterate all tables.
-        $tables = $wpdb->get_col( 'SHOW TABLES' );
-        if ( empty( $tables ) ) {
-            return true;
-        }
-
-        foreach ( $tables as $table ) {
-            $this->rewrite_table( $table, $replacements );
-        }
-
-        return true;
-    }
-
-    /**
-     * Build search/replace pairs covering http, https, and schemeless variants.
-     */
-    private function build_replacement_pairs( $old_url, $new_url ) {
-        $pairs = [];
-
-        // Exact URL as-is.
-        $pairs[] = [ $old_url, $new_url ];
-
-        // Opposite scheme variant.
         if ( 0 === strpos( $old_url, 'https://' ) ) {
-            $old_http = 'http://' . substr( $old_url, 8 );
-            $new_http = 'http://' . substr( $new_url, 8 );
-            $pairs[]  = [ $old_http, $new_http ];
+            $pairs[] = [ 'http://' . substr( $old_url, 8 ), 'http://' . substr( $new_url, 8 ) ];
         } elseif ( 0 === strpos( $old_url, 'http://' ) ) {
-            $old_https = 'https://' . substr( $old_url, 7 );
-            $new_https = 'https://' . substr( $new_url, 7 );
-            $pairs[]   = [ $old_https, $new_https ];
+            $pairs[] = [ 'https://' . substr( $old_url, 7 ), 'https://' . substr( $new_url, 7 ) ];
         }
 
-        // Schemeless (e.g. //old.example.com → //new.example.com).
         $old_schemeless = preg_replace( '#^https?:#', '', $old_url );
         $new_schemeless = preg_replace( '#^https?:#', '', $new_url );
         if ( $old_schemeless !== $new_schemeless ) {
             $pairs[] = [ $old_schemeless, $new_schemeless ];
         }
 
-        return $pairs;
+        // Open a raw mysqli connection to avoid $wpdb corrupting % in values.
+        $dbh = $this->get_raw_dbh();
+        if ( ! $dbh ) {
+            return new WP_Error( 'yawp_restore', 'Could not open database connection for URL rewrite.' );
+        }
+
+        $tables = $wpdb->get_col( 'SHOW TABLES' );
+
+        foreach ( $tables as $table ) {
+            $columns = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
+            $text_cols = [];
+            foreach ( $columns as $col ) {
+                if ( preg_match( '/varchar|text|longtext|mediumtext/i', $col['Type'] ) ) {
+                    $text_cols[] = $col['Field'];
+                }
+            }
+
+            if ( empty( $text_cols ) ) {
+                continue;
+            }
+
+            foreach ( $pairs as $pair ) {
+                $old_esc = mysqli_real_escape_string( $dbh, $pair[0] );
+                $new_esc = mysqli_real_escape_string( $dbh, $pair[1] );
+
+                foreach ( $text_cols as $col ) {
+                    mysqli_query( $dbh,
+                        "UPDATE `{$table}` SET `{$col}` = REPLACE(`{$col}`, '{$old_esc}', '{$new_esc}') WHERE `{$col}` LIKE '%{$old_esc}%'"
+                    );
+                }
+            }
+        }
+
+        mysqli_close( $dbh );
+        return true;
     }
 
     /**
-     * Rewrite URLs in a single table, handling serialized data.
+     * Open a raw mysqli connection using WordPress DB constants.
      */
-    private function rewrite_table( $table, $replacements ) {
-        global $wpdb;
+    private function get_raw_dbh() {
+        $host = DB_HOST;
+        $port = 3306;
 
-        // Identify text columns.
-        $text_columns = [];
-        $columns      = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
-        foreach ( $columns as $col ) {
-            if ( preg_match( '/varchar|text|longtext|mediumtext/i', $col['Type'] ) ) {
-                $text_columns[] = $col['Field'];
-            }
+        if ( strpos( $host, ':' ) !== false ) {
+            list( $host, $port ) = explode( ':', $host, 2 );
+            $port = (int) $port;
         }
 
-        if ( empty( $text_columns ) ) {
-            return;
+        $dbh = mysqli_init();
+
+        if ( defined( 'MYSQL_CLIENT_FLAGS' ) && ( MYSQL_CLIENT_FLAGS & MYSQLI_CLIENT_SSL ) ) {
+            mysqli_ssl_set( $dbh, null, null, null, null, null );
         }
 
-        // Discover primary key for targeted UPDATEs.
-        $pk_col  = null;
-        $pk_rows = $wpdb->get_results( "SHOW KEYS FROM `{$table}` WHERE Key_name = 'PRIMARY'", ARRAY_A );
-        if ( ! empty( $pk_rows ) ) {
-            $pk_col = $pk_rows[0]['Column_name'];
+        if ( ! mysqli_real_connect( $dbh, $host, DB_USER, DB_PASSWORD, DB_NAME, $port, null, defined( 'MYSQL_CLIENT_FLAGS' ) ? MYSQL_CLIENT_FLAGS : 0 ) ) {
+            return false;
         }
 
-        // Build WHERE clause to find rows containing any old URL.
-        $old_strings = array_column( $replacements, 0 );
-        $where_parts = [];
-        foreach ( $text_columns as $col ) {
-            foreach ( $old_strings as $old ) {
-                $where_parts[] = $wpdb->prepare( "`{$col}` LIKE %s", '%' . $wpdb->esc_like( $old ) . '%' );
-            }
-        }
-        $where = implode( ' OR ', $where_parts );
-
-        // Select columns for reading — primary key + text columns.
-        $select_cols = $text_columns;
-        if ( $pk_col && ! in_array( $pk_col, $select_cols, true ) ) {
-            array_unshift( $select_cols, $pk_col );
-        }
-        $select_str = implode( ', ', array_map( function ( $c ) { return "`{$c}`"; }, $select_cols ) );
-
-        // Batch processing.
-        $offset = 0;
-        $batch  = 500;
-
-        while ( true ) {
-            $rows = $wpdb->get_results(
-                "SELECT {$select_str} FROM `{$table}` WHERE {$where} LIMIT {$batch} OFFSET {$offset}",
-                ARRAY_A
-            );
-
-            if ( empty( $rows ) ) {
-                break;
-            }
-
-            foreach ( $rows as $row ) {
-                $updates = [];
-
-                foreach ( $text_columns as $col ) {
-                    if ( ! isset( $row[ $col ] ) || null === $row[ $col ] ) {
-                        continue;
-                    }
-
-                    $original = $row[ $col ];
-                    $modified = $this->replace_in_value( $original, $replacements );
-
-                    if ( $modified !== $original ) {
-                        $updates[ $col ] = $modified;
-                    }
-                }
-
-                if ( empty( $updates ) ) {
-                    continue;
-                }
-
-                // Build UPDATE query manually. We must bypass $wpdb->prepare()
-                // because it corrupts % characters (e.g. "width: 100%" in CSS
-                // or Gutenberg block attributes) via its placeholder escaping.
-                // Use _real_escape for SQL injection safety, then strip the
-                // WordPress placeholder escape hash to get clean escaped values.
-                $set_parts = [];
-                foreach ( $updates as $col => $val ) {
-                    $escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $val ) );
-                    $set_parts[] = "`{$col}` = '{$escaped}'";
-                }
-                $set_sql = implode( ', ', $set_parts );
-
-                if ( $pk_col && isset( $row[ $pk_col ] ) ) {
-                    $pk_escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $row[ $pk_col ] ) );
-                    $wpdb->query( "UPDATE `{$table}` SET {$set_sql} WHERE `{$pk_col}` = '{$pk_escaped}'" );
-                } else {
-                    // Fallback: update by matching old column values.
-                    $where_parts_row = [];
-                    foreach ( $text_columns as $col ) {
-                        if ( isset( $row[ $col ] ) ) {
-                            $escaped = $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $row[ $col ] ) );
-                            $where_parts_row[] = "`{$col}` = '{$escaped}'";
-                        }
-                    }
-                    $wpdb->query( "UPDATE `{$table}` SET {$set_sql} WHERE " . implode( ' AND ', $where_parts_row ) );
-                }
-            }
-
-            // If we got fewer rows than the batch, we're done.
-            if ( count( $rows ) < $batch ) {
-                break;
-            }
-
-            $offset += $batch;
-        }
-    }
-
-    /**
-     * Replace URLs in a value, handling serialized data.
-     */
-    private function replace_in_value( $value, $replacements ) {
-        $unserialized = @maybe_unserialize( $value );
-
-        if ( is_serialized( $value ) ) {
-            // Walk the unserialized structure and replace strings.
-            $unserialized = $this->recursive_replace( $unserialized, $replacements );
-            return maybe_serialize( $unserialized );
-        }
-
-        // Plain string — simple replacement.
-        foreach ( $replacements as $pair ) {
-            $value = str_replace( $pair[0], $pair[1], $value );
-        }
-
-        return $value;
-    }
-
-    /**
-     * Recursively walk a data structure, replacing URL strings.
-     */
-    private function recursive_replace( $data, $replacements ) {
-        if ( is_string( $data ) ) {
-            foreach ( $replacements as $pair ) {
-                $data = str_replace( $pair[0], $pair[1], $data );
-            }
-            return $data;
-        }
-
-        if ( is_array( $data ) ) {
-            foreach ( $data as $key => $val ) {
-                $data[ $key ] = $this->recursive_replace( $val, $replacements );
-            }
-            return $data;
-        }
-
-        if ( is_object( $data ) ) {
-            foreach ( get_object_vars( $data ) as $prop => $val ) {
-                $data->$prop = $this->recursive_replace( $val, $replacements );
-            }
-            return $data;
-        }
-
-        return $data;
+        mysqli_set_charset( $dbh, DB_CHARSET );
+        return $dbh;
     }
 }

@@ -126,7 +126,7 @@ class YAWP_Backup {
 
     private function build_tar_command( $type, $archive, $tmp_dir ) {
         $webroot = '/var/www/html';
-        $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp';
+        $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp --exclude=.git --exclude=.claude';
 
         if ( 'incremental' === $type ) {
             $last = get_option( 'yawp_last_backup_time', '' );
