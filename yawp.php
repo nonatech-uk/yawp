@@ -50,9 +50,9 @@ register_activation_hook( __FILE__, function () {
     $defaults = [
         'yawp_s3_access_key'       => '',
         'yawp_s3_secret_key'       => '',
-        'yawp_s3_region'           => 'eu-central-1',
-        'yawp_s3_bucket'           => '',
-        'yawp_s3_prefix'           => '',
+        'yawp_s3_region'           => 'eu-west-2',
+        'yawp_s3_bucket'           => 'nonatech-zermatt-ski-service-backups-017147418967',
+        'yawp_s3_prefix'           => 'backups',
         'yawp_retention_days'      => 90,
         'yawp_full_backup_interval' => 0,
         'yawp_backup_history'      => '[]',

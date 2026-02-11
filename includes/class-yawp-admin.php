@@ -124,7 +124,7 @@ class YAWP_Admin {
     private function get_s3_from_options() {
         $access_key = get_option( 'yawp_s3_access_key', '' );
         $secret_key = self::decrypt_secret( get_option( 'yawp_s3_secret_key', '' ) );
-        $region     = get_option( 'yawp_s3_region', 'eu-central-1' );
+        $region     = get_option( 'yawp_s3_region', 'eu-west-2' );
         $bucket     = get_option( 'yawp_s3_bucket', '' );
 
         if ( ! $access_key || ! $secret_key || ! $bucket ) {
@@ -150,7 +150,7 @@ class YAWP_Admin {
             'ap-northeast-1' => 'Asia Pacific (Tokyo)',
         ];
 
-        $current_region = get_option( 'yawp_s3_region', 'eu-central-1' );
+        $current_region = get_option( 'yawp_s3_region', 'eu-west-2' );
         $has_secret     = '' !== get_option( 'yawp_s3_secret_key', '' );
         $login_date     = get_option( 'yawp_login_date', '' );
         $last_backup    = get_option( 'yawp_last_backup_time', 'Never' );

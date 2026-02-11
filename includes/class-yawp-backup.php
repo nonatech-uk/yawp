@@ -153,7 +153,7 @@ class YAWP_Backup {
     private function get_s3() {
         $access_key = get_option( 'yawp_s3_access_key', '' );
         $secret_key = YAWP_Admin::decrypt_secret( get_option( 'yawp_s3_secret_key', '' ) );
-        $region     = get_option( 'yawp_s3_region', 'eu-central-1' );
+        $region     = get_option( 'yawp_s3_region', 'eu-west-2' );
         $bucket     = get_option( 'yawp_s3_bucket', '' );
 
         if ( ! $access_key || ! $secret_key || ! $bucket ) {
