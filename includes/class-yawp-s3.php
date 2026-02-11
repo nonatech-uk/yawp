@@ -65,10 +65,12 @@ class YAWP_S3 {
     public function put_object( $key, $file_path, $retention_days = 90 ) {
         $size     = filesize( $file_path );
         $sha256   = hash_file( 'sha256', $file_path );
+        $md5      = base64_encode( md5_file( $file_path, true ) );
         $retain   = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
 
         $headers = [
             'Content-Length'                       => $size,
+            'Content-MD5'                          => $md5,
             'Content-Type'                         => 'application/gzip',
             'x-amz-content-sha256'                 => $sha256,
             'x-amz-object-lock-mode'               => 'COMPLIANCE',
@@ -193,12 +195,14 @@ class YAWP_S3 {
 
     private function upload_part( $key, $upload_id, $part_number, $data ) {
         $sha256 = hash( 'sha256', $data );
+        $md5    = base64_encode( md5( $data, true ) );
         $qs     = 'partNumber=' . $part_number . '&uploadId=' . urlencode( $upload_id );
         $path   = $this->path( $key ) . '?' . $qs;
         $url    = $this->url( $key ) . '?' . $qs;
 
         $headers = [
             'Content-Length'       => strlen( $data ),
+            'Content-MD5'          => $md5,
             'x-amz-content-sha256' => $sha256,
         ];
 
