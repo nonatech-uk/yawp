@@ -116,7 +116,7 @@ class YAWP_Restore {
             }
 
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = '--exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp';
+            $tar_excludes = '--exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php';
 
             // ── Build the chain of archives to extract files from ──
             // For an incremental: full → each incremental up to and including
