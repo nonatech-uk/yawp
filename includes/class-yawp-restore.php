@@ -116,7 +116,7 @@ class YAWP_Restore {
             }
 
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = '--overwrite --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude=.claude --exclude=*/.git --exclude=./.git';
+            $tar_excludes = "--overwrite --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
 
             // ── Build the chain of archives to extract files from ──
             // For an incremental: full → each incremental up to and including
@@ -300,15 +300,21 @@ class YAWP_Restore {
      * @return true|WP_Error
      */
     private function import_sql( $file_path ) {
-        global $wpdb;
+        // Use raw mysqli for the entire SQL import to avoid $wpdb->query()
+        // corrupting % characters via WordPress placeholder escaping.
+        $dbh = $this->get_raw_dbh();
+        if ( ! $dbh ) {
+            return new WP_Error( 'yawp_restore', 'Could not open database connection for SQL import.' );
+        }
 
         $fh = fopen( $file_path, 'r' );
         if ( ! $fh ) {
+            mysqli_close( $dbh );
             return new WP_Error( 'yawp_restore', 'Cannot open SQL file.' );
         }
 
         $buffer = '';
-        $wpdb->query( 'SET foreign_key_checks = 0' );
+        mysqli_query( $dbh, 'SET foreign_key_checks = 0' );
 
         while ( false !== ( $line = fgets( $fh ) ) ) {
             $trimmed = trim( $line );
@@ -322,19 +328,20 @@ class YAWP_Restore {
 
             // Execute when we hit a statement-ending semicolon.
             if ( ';' === substr( $trimmed, -1 ) ) {
-                $wpdb->query( $buffer );
+                mysqli_query( $dbh, $buffer );
                 $buffer = '';
             }
         }
 
         // Execute any remaining buffered SQL.
         if ( '' !== trim( $buffer ) ) {
-            $wpdb->query( $buffer );
+            mysqli_query( $dbh, $buffer );
         }
 
-        $wpdb->query( 'SET foreign_key_checks = 1' );
+        mysqli_query( $dbh, 'SET foreign_key_checks = 1' );
 
         fclose( $fh );
+        mysqli_close( $dbh );
         return true;
     }
 
