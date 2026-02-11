@@ -121,6 +121,21 @@ class YAWP_Restore {
                 return $result;
             }
 
+            // ── Extract files to webroot first ──
+            // Files must be in place before DB import so WordPress doesn't
+            // deactivate plugins when it validates active_plugins on the
+            // next page load.
+            $webroot = rtrim( ABSPATH, '/' );
+            $cmd     = sprintf(
+                'tar xzf %s -C %s --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp 2>&1',
+                escapeshellarg( $archive_path ),
+                escapeshellarg( $webroot )
+            );
+            exec( $cmd, $output, $exit_code );
+            if ( 0 !== $exit_code ) {
+                return new WP_Error( 'yawp_restore', 'Failed to extract files: ' . implode( "\n", $output ) );
+            }
+
             // ── Extract just database.sql ──
             $cmd = sprintf(
                 'tar xzf %s -C %s database.sql 2>&1',
@@ -167,18 +182,6 @@ class YAWP_Restore {
                         return $rewrite_result;
                     }
                 }
-            }
-
-            // ── Extract files to webroot ──
-            $webroot = rtrim( ABSPATH, '/' );
-            $cmd     = sprintf(
-                'tar xzf %s -C %s --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp 2>&1',
-                escapeshellarg( $archive_path ),
-                escapeshellarg( $webroot )
-            );
-            exec( $cmd, $output, $exit_code );
-            if ( 0 !== $exit_code ) {
-                return new WP_Error( 'yawp_restore', 'Failed to extract files: ' . implode( "\n", $output ) );
             }
 
             // ── Flush rewrite rules ──
