@@ -345,9 +345,11 @@ class YAWP_S3 {
      */
     public function put_json( $key, $json_string ) {
         $sha256 = hash( 'sha256', $json_string );
+        $md5    = base64_encode( md5( $json_string, true ) );
 
         $headers = [
             'Content-Length'       => strlen( $json_string ),
+            'Content-MD5'          => $md5,
             'Content-Type'         => 'application/json',
             'x-amz-content-sha256' => $sha256,
         ];
@@ -373,6 +375,45 @@ class YAWP_S3 {
         }
         if ( $code < 200 || $code >= 300 ) {
             return new WP_Error( 'yawp_s3', "S3 PUT JSON failed (HTTP {$code}): " . $this->parse_s3_error( $response ) );
+        }
+        return true;
+    }
+
+    /**
+     * Upload a plain-text string (no Object Lock — overwritable).
+     */
+    public function put_text( $key, $text ) {
+        $sha256 = hash( 'sha256', $text );
+        $md5    = base64_encode( md5( $text, true ) );
+
+        $headers = [
+            'Content-Length'       => strlen( $text ),
+            'Content-MD5'          => $md5,
+            'Content-Type'         => 'text/plain; charset=utf-8',
+            'x-amz-content-sha256' => $sha256,
+        ];
+
+        $signed = $this->sign_request( 'PUT', $this->path( $key ), $headers, $sha256 );
+
+        $ch = curl_init( $this->url( $key ) );
+        curl_setopt_array( $ch, [
+            CURLOPT_CUSTOMREQUEST  => 'PUT',
+            CURLOPT_POSTFIELDS     => $text,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => $this->format_headers( $signed ),
+            CURLOPT_TIMEOUT        => 30,
+        ]);
+
+        $response = curl_exec( $ch );
+        $code     = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+        $error    = curl_error( $ch );
+        curl_close( $ch );
+
+        if ( $error ) {
+            return new WP_Error( 'yawp_s3', 'cURL error: ' . $error );
+        }
+        if ( $code < 200 || $code >= 300 ) {
+            return new WP_Error( 'yawp_s3', "S3 PUT text failed (HTTP {$code}): " . $this->parse_s3_error( $response ) );
         }
         return true;
     }

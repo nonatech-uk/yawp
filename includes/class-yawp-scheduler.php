@@ -43,6 +43,13 @@ class YAWP_Scheduler {
             return;
         }
 
-        // 4. Nothing to do.
+        // 4. Nothing to do — write skip marker.
+        $s3 = $backup->get_s3_public();
+        if ( ! is_wp_error( $s3 ) ) {
+            $prefix    = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
+            $timestamp = gmdate( 'Y-m-d_His' );
+            $key       = ( $prefix ? $prefix . '/' : '' ) . 'incremental/' . $timestamp . '.skipped';
+            $s3->put_text( $key, 'No login detected. Backup skipped at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC.' );
+        }
     }
 }

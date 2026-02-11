@@ -6,9 +6,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class YAWP_Backup {
 
-    const LOCK_KEY  = 'yawp_backup_running';
-    const LOCK_TTL  = 900; // 15 minutes
-    const DISK_REQ  = 419430400; // ~400 MB
+    const LOCK_KEY       = 'yawp_backup_running';
+    const LOCK_TTL       = 900; // 15 minutes
+    const DISK_REQ       = 419430400; // ~400 MB
+    const RETENTION_DAYS = 90;
+
+    private $log = '';
 
     /**
      * Run a full backup.
@@ -24,11 +27,27 @@ class YAWP_Backup {
         return $this->run( 'incremental' );
     }
 
+    /**
+     * Public S3 client getter — used by the scheduler for marker files.
+     */
+    public function get_s3_public() {
+        return $this->get_s3();
+    }
+
+    private function log( $message ) {
+        $this->log .= '[' . gmdate( 'Y-m-d H:i:s' ) . '] ' . $message . "\n";
+    }
+
     private function run( $type ) {
+        $this->log = '';
+        $this->log( 'Starting ' . $type . ' backup.' );
+
         if ( get_transient( self::LOCK_KEY ) ) {
             return new WP_Error( 'yawp_backup', 'A backup is already running.' );
         }
         set_transient( self::LOCK_KEY, time(), self::LOCK_TTL );
+
+        $this->healthcheck( 'start' );
 
         if ( function_exists( 'set_time_limit' ) ) {
             @set_time_limit( 600 );
@@ -49,14 +68,17 @@ class YAWP_Backup {
             }
 
             // 1. Export database.
+            $this->log( 'Exporting database.' );
             $db_file = $tmp_dir . '/database.sql';
             $exporter = new YAWP_DB_Export();
             $result   = $exporter->export( $db_file );
             if ( is_wp_error( $result ) ) {
                 return $this->fail( $result->get_error_message() );
             }
+            $this->log( 'Database exported (' . size_format( filesize( $db_file ) ) . ').' );
 
             // 2. Build tar.
+            $this->log( 'Building tar archive.' );
             $archive = $tmp_dir . '/backup.tar.gz';
             $tar_cmd = $this->build_tar_command( $type, $archive, $tmp_dir );
             $output  = [];
@@ -69,8 +91,10 @@ class YAWP_Backup {
             if ( ! file_exists( $archive ) ) {
                 return $this->fail( 'Archive was not created.' );
             }
+            $this->log( 'Archive created (' . size_format( filesize( $archive ) ) . ').' );
 
             // 3. Upload to S3.
+            $this->log( 'Uploading to S3.' );
             $s3  = $this->get_s3();
             if ( is_wp_error( $s3 ) ) {
                 return $this->fail( $s3->get_error_message() );
@@ -78,16 +102,20 @@ class YAWP_Backup {
 
             $prefix = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
             $s3_key = ( $prefix ? $prefix . '/' : '' ) . $type . '/' . $timestamp . '.tar.gz';
-            $retention = (int) get_option( 'yawp_retention_days', 90 );
 
-            $upload = $s3->upload( $s3_key, $archive, $retention );
+            $upload = $s3->upload( $s3_key, $archive, self::RETENTION_DAYS );
             if ( is_wp_error( $upload ) ) {
                 return $this->fail( $upload->get_error_message() );
             }
+            $this->log( 'Upload complete: ' . $s3_key );
 
             $file_size = filesize( $archive );
 
-            // 4. Update manifest on S3.
+            // 4. Upload README if it doesn't exist yet.
+            $this->maybe_upload_readme( $s3, $prefix );
+
+            // 5. Update manifest on S3.
+            $this->log( 'Updating manifest.' );
             $manifest_key = ( $prefix ? $prefix . '/' : '' ) . 'manifest.json';
             $manifest = [
                 'last_backup'  => $timestamp,
@@ -97,7 +125,7 @@ class YAWP_Backup {
             ];
             $s3->put_json( $manifest_key, wp_json_encode( $manifest ) );
 
-            // 5. Record in wp_options.
+            // 6. Record in wp_options.
             $now = current_time( 'mysql', true );
             update_option( 'yawp_last_backup_time', $now, false );
             if ( 'full' === $type ) {
@@ -114,6 +142,9 @@ class YAWP_Backup {
 
             delete_option( 'yawp_last_error' );
 
+            $this->log( ucfirst( $type ) . ' backup completed successfully.' );
+            $this->healthcheck( 'success', $this->log );
+
             return true;
 
         } catch ( \Throwable $e ) {
@@ -122,6 +153,109 @@ class YAWP_Backup {
             $this->cleanup( $tmp_dir );
             delete_transient( self::LOCK_KEY );
         }
+    }
+
+    private function maybe_upload_readme( $s3, $prefix ) {
+        $readme_key = ( $prefix ? $prefix . '/' : '' ) . 'README.txt';
+
+        // Check if README already exists by listing with exact prefix.
+        $objects = $s3->list_objects( $readme_key );
+        if ( ! is_wp_error( $objects ) ) {
+            foreach ( $objects as $obj ) {
+                if ( $obj['Key'] === $readme_key ) {
+                    return; // Already exists.
+                }
+            }
+        }
+
+        $this->log( 'Uploading README.txt.' );
+
+        $siteurl = get_option( 'siteurl' );
+        $date    = gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+        $pfx     = $prefix ?: '{prefix}';
+
+        $readme = <<<TXT
+YAWP Backup Repository
+=======================
+
+This bucket contains WordPress backups created by the YAWP plugin.
+https://github.com/nonatech-uk/yawp
+
+Source site: {$siteurl}
+Created:     {$date}
+
+Structure
+---------
+{$pfx}/full/YYYY-MM-DD_HHMMSS.tar.gz         Full site backup
+{$pfx}/incremental/YYYY-MM-DD_HHMMSS.tar.gz   Incremental (changed files + full DB)
+{$pfx}/incremental/YYYY-MM-DD_HHMMSS.skipped  Marker — scheduled job ran, no changes detected
+{$pfx}/manifest.json                           Last backup metadata
+{$pfx}/README.txt                              This file
+
+Each .tar.gz archive contains:
+- database.sql        Full database dump
+- ./                  WordPress webroot files (relative paths)
+
+Excluded from archives:
+- wp-config.php              Preserves target site's DB credentials and salts
+- wp-content/plugins/yawp    The plugin itself (install separately)
+- wp-content/object-cache.php  Drop-in cache config (site-specific)
+- wp-content/cache           Cache files
+- .git                       Version control data
+- .claude                    IDE config
+
+Restoring
+---------
+1. Fresh WordPress install on target server
+2. Install and activate the YAWP plugin
+3. Go to Settings > YAWP Backup
+4. Enter S3 credentials and save settings
+5. Use the Restore section to list and restore a backup
+6. If restoring to a different domain, enter the new URL before restoring
+
+S3 Configuration
+----------------
+The IAM user needs the following permissions on this bucket:
+
+  s3:PutObject
+  s3:GetObject
+  s3:ListBucket
+  s3:AbortMultipartUpload
+  s3:ListMultipartUploadParts
+
+Bucket settings:
+- Object Lock: Enabled (COMPLIANCE mode, 90-day retention)
+- Versioning: Enabled (required by Object Lock)
+
+Example bucket name:  my-site-backups-123456789012
+Example prefix:       backups
+
+The prefix determines the folder within the bucket. A typical setup:
+  Bucket: my-company-wordpress-backups-123456789012
+  Prefix: my-site-name
+
+This gives S3 paths like:
+  my-site-name/full/2026-02-11_030000.tar.gz
+  my-site-name/incremental/2026-02-12_030000.tar.gz
+
+Scheduling
+----------
+YAWP runs a daily check (default 03:00 UTC). The logic:
+
+1. No full backup exists    → run full backup
+2. Full backup interval elapsed → run full backup
+3. Someone logged in today  → run incremental backup
+4. No login detected        → skip (write .skipped marker)
+
+IMPORTANT: Incremental backups ONLY run when a WordPress user has
+logged in since the last backup. If nobody logs in, no incremental
+is created — only a .skipped marker file to confirm the job ran.
+
+Objects in this bucket are protected by S3 Object Lock (COMPLIANCE
+mode) and cannot be deleted or modified during the retention period.
+TXT;
+
+        $s3->put_text( $readme_key, $readme );
     }
 
     private function build_tar_command( $type, $archive, $tmp_dir ) {
@@ -174,6 +308,8 @@ class YAWP_Backup {
     }
 
     private function fail( $message ) {
+        $this->log( 'FAILED: ' . $message );
+        $this->healthcheck( 'fail', $this->log );
         update_option( 'yawp_last_error', $message, false );
         $this->add_history_entry( [
             'date'   => current_time( 'mysql', true ),
@@ -184,6 +320,26 @@ class YAWP_Backup {
         ]);
         delete_transient( self::LOCK_KEY );
         return new WP_Error( 'yawp_backup', $message );
+    }
+
+    private function healthcheck( $event, $log = '' ) {
+        $url = get_option( 'yawp_healthchecks_url', '' );
+        if ( empty( $url ) ) {
+            return;
+        }
+
+        $body = wp_json_encode( [
+            'event'     => $event,
+            'timestamp' => gmdate( 'Y-m-d\TH:i:s\Z' ),
+            'site'      => get_option( 'siteurl' ),
+            'log'       => substr( $log, -10000 ),
+        ] );
+
+        wp_remote_post( $url, [
+            'body'    => $body,
+            'headers' => [ 'Content-Type' => 'application/json' ],
+            'timeout' => 10,
+        ] );
     }
 
     private function cleanup( $dir ) {

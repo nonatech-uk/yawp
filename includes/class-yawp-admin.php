@@ -40,8 +40,8 @@ class YAWP_Admin {
             'yawp_s3_region'            => 'sanitize_text_field',
             'yawp_s3_bucket'            => 'sanitize_text_field',
             'yawp_s3_prefix'            => 'sanitize_text_field',
-            'yawp_retention_days'       => 'absint',
             'yawp_full_backup_interval' => 'absint',
+            'yawp_healthchecks_url'     => 'esc_url_raw',
         ];
         foreach ( $fields as $name => $sanitize ) {
             register_setting( 'yawp_settings', $name, [ 'sanitize_callback' => $sanitize ] );
@@ -227,6 +227,7 @@ class YAWP_Admin {
             <form method="post" action="options.php">
                 <?php settings_fields( 'yawp_settings' ); ?>
                 <h2>S3 Settings</h2>
+                <p class="description">Configure your S3 bucket connection. Remember to <strong>Save Settings</strong> before using Test Connection or running backups.</p>
                 <table class="form-table">
                     <tr>
                         <th><label for="yawp_s3_access_key">AWS Access Key ID</label></th>
@@ -260,21 +261,23 @@ class YAWP_Admin {
                             <p class="description">e.g. <code>pitstop</code> — no leading/trailing slashes.</p></td>
                     </tr>
                     <tr>
-                        <th><label for="yawp_retention_days">Retention (days)</label></th>
-                        <td><input type="number" id="yawp_retention_days" name="yawp_retention_days" min="1"
-                            value="<?php echo esc_attr( get_option( 'yawp_retention_days', 90 ) ); ?>" class="small-text" /></td>
-                    </tr>
-                    <tr>
                         <th><label for="yawp_full_backup_interval">Full backup every X days</label></th>
                         <td><input type="number" id="yawp_full_backup_interval" name="yawp_full_backup_interval" min="0"
                             value="<?php echo esc_attr( get_option( 'yawp_full_backup_interval', 0 ) ); ?>" class="small-text" />
-                            <p class="description">0 = only run full backup manually or on first activation.</p></td>
+                            <p class="description"><code>0</code> = only on first activation or manually. Incrementals run daily but <strong>only when a user has logged in</strong>.</p></td>
+                    </tr>
+                    <tr>
+                        <th><label for="yawp_healthchecks_url">Healthchecks URL</label></th>
+                        <td><input type="url" id="yawp_healthchecks_url" name="yawp_healthchecks_url"
+                            value="<?php echo esc_attr( get_option( 'yawp_healthchecks_url', '' ) ); ?>" class="regular-text" />
+                            <p class="description">Optional. Full URL to ping on backup start/finish. Leave blank to disable.</p></td>
                     </tr>
                 </table>
                 <?php submit_button( 'Save Settings' ); ?>
             </form>
 
             <h2>Actions</h2>
+            <p class="description"><strong>Note:</strong> You must save settings before testing the connection or running a backup.</p>
             <div class="yawp-actions">
                 <button class="button" id="yawp-test-connection">Test S3 Connection</button>
                 <button class="button button-primary" id="yawp-run-full">Run Full Backup</button>
