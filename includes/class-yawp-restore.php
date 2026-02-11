@@ -115,28 +115,49 @@ class YAWP_Restore {
                 return new WP_Error( 'yawp_restore', 'Cannot create temp directory.' );
             }
 
-            // ── Download archive ──
-            $result = $this->s3->get_object( $s3_key, $archive_path );
-            if ( is_wp_error( $result ) ) {
-                return $result;
+            $webroot      = rtrim( ABSPATH, '/' );
+            $tar_excludes = '--exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp';
+
+            // ── Build the chain of archives to extract files from ──
+            // For an incremental: full → each incremental up to and including
+            // the selected one. Each incremental only has files changed since
+            // the previous backup, so we must layer them all in order.
+            // The DB always comes from the selected (final) archive.
+            $file_chain = $this->build_restore_chain( $s3_key );
+            if ( is_wp_error( $file_chain ) ) {
+                return $file_chain;
             }
 
-            // ── Extract files to webroot first ──
-            // Files must be in place before DB import so WordPress doesn't
-            // deactivate plugins when it validates active_plugins on the
-            // next page load.
-            $webroot = rtrim( ABSPATH, '/' );
-            $cmd     = sprintf(
-                'tar xzf %s -C %s --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp 2>&1',
-                escapeshellarg( $archive_path ),
-                escapeshellarg( $webroot )
-            );
-            exec( $cmd, $output, $exit_code );
-            if ( 0 !== $exit_code ) {
-                return new WP_Error( 'yawp_restore', 'Failed to extract files: ' . implode( "\n", $output ) );
+            // ── Download and extract files from each archive in order ──
+            foreach ( $file_chain as $i => $chain_key ) {
+                $chain_archive = $tmp_dir . 'chain_' . $i . '.tar.gz';
+                $result = $this->s3->get_object( $chain_key, $chain_archive );
+                if ( is_wp_error( $result ) ) {
+                    return $result;
+                }
+
+                $output = [];
+                $cmd = sprintf(
+                    'tar xzf %s -C %s %s 2>&1',
+                    escapeshellarg( $chain_archive ),
+                    escapeshellarg( $webroot ),
+                    $tar_excludes
+                );
+                exec( $cmd, $output, $exit_code );
+                if ( 0 !== $exit_code ) {
+                    return new WP_Error( 'yawp_restore', 'Failed to extract files from ' . basename( $chain_key ) . ': ' . implode( "\n", $output ) );
+                }
+
+                // Keep the last archive for DB extraction, delete the rest.
+                if ( $chain_key !== $s3_key ) {
+                    @unlink( $chain_archive );
+                } else {
+                    $archive_path = $chain_archive;
+                }
             }
 
-            // ── Extract just database.sql ──
+            // ── Extract database.sql (always from the selected archive) ──
+            $output = [];
             $cmd = sprintf(
                 'tar xzf %s -C %s database.sql 2>&1',
                 escapeshellarg( $archive_path ),
@@ -196,6 +217,74 @@ class YAWP_Restore {
             }
             delete_transient( 'yawp_restore_running' );
         }
+    }
+
+    // ──────────────────────────────────────────────
+    // Restore chain helpers
+    // ──────────────────────────────────────────────
+
+    /**
+     * Build the ordered list of S3 keys to extract files from.
+     *
+     * For a full backup: just that key.
+     * For an incremental: preceding full → every incremental between that
+     * full and the selected one (inclusive), sorted oldest-first.
+     *
+     * @param string $s3_key The selected backup key.
+     * @return array|WP_Error Ordered list of S3 keys.
+     */
+    private function build_restore_chain( $s3_key ) {
+        if ( false === strpos( $s3_key, '/incremental/' ) ) {
+            return [ $s3_key ];
+        }
+
+        $backups = $this->list_backups();
+        if ( is_wp_error( $backups ) ) {
+            return $backups;
+        }
+
+        // Sort oldest-first for chain building.
+        usort( $backups, function ( $a, $b ) {
+            return strcmp( $a['date'], $b['date'] );
+        } );
+
+        // Find the selected backup's date.
+        $selected_date = '';
+        foreach ( $backups as $b ) {
+            if ( $b['s3_key'] === $s3_key ) {
+                $selected_date = $b['date'];
+                break;
+            }
+        }
+
+        if ( '' === $selected_date ) {
+            return new WP_Error( 'yawp_restore', 'Selected backup not found in listing.' );
+        }
+
+        // Find the most recent full backup that predates the selected incremental.
+        $full_key  = '';
+        $full_date = '';
+        foreach ( $backups as $b ) {
+            if ( 'full' === $b['type'] && $b['date'] <= $selected_date ) {
+                $full_key  = $b['s3_key'];
+                $full_date = $b['date'];
+            }
+        }
+
+        if ( '' === $full_key ) {
+            return new WP_Error( 'yawp_restore', 'No full backup found before this incremental. Restore a full backup first.' );
+        }
+
+        // Build chain: full, then each incremental after the full up to
+        // and including the selected one.
+        $chain = [ $full_key ];
+        foreach ( $backups as $b ) {
+            if ( 'incremental' === $b['type'] && $b['date'] > $full_date && $b['date'] <= $selected_date ) {
+                $chain[] = $b['s3_key'];
+            }
+        }
+
+        return $chain;
     }
 
     // ──────────────────────────────────────────────
