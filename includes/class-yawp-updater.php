@@ -6,11 +6,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class YAWP_Updater {
 
-    private $plugin_slug = 'yawp/yawp.php';
+    private $plugin_slug;
     private $cache_key   = 'yawp_github_release';
-    private $cache_ttl   = 3600; // 1 hour
+    private $cache_ttl   = 43200; // 12 hours
 
     public function __construct() {
+        // Detect actual plugin slug from wherever yawp.php lives (handles yawp-main/, yawp/, etc).
+        $this->plugin_slug = plugin_basename( YAWP_PATH . 'yawp.php' );
+
         add_filter( 'pre_set_site_transient_update_plugins', [ $this, 'check_update' ] );
         add_filter( 'plugins_api', [ $this, 'plugin_info' ], 10, 3 );
         add_filter( 'upgrader_post_install', [ $this, 'post_install' ], 10, 3 );
@@ -24,23 +27,35 @@ class YAWP_Updater {
             return $transient;
         }
 
-        // Clear our cache so we always get the latest from GitHub.
-        delete_transient( $this->cache_key );
         $release = $this->get_latest_release();
+
         if ( ! $release ) {
+            // API failed (rate-limited, etc.) — still register so the
+            // auto-updates toggle appears in the plugins list.
+            $transient->no_update[ $this->plugin_slug ] = (object) [
+                'slug'        => 'yawp',
+                'plugin'      => $this->plugin_slug,
+                'new_version' => YAWP_VERSION,
+                'url'         => 'https://github.com/' . YAWP_GITHUB_REPO,
+                'package'     => '',
+            ];
             return $transient;
         }
 
         $remote_version = ltrim( $release['tag_name'], 'v' );
 
+        $item = (object) [
+            'slug'        => 'yawp',
+            'plugin'      => $this->plugin_slug,
+            'new_version' => $remote_version,
+            'url'         => 'https://github.com/' . YAWP_GITHUB_REPO,
+            'package'     => $release['zipball_url'],
+        ];
+
         if ( version_compare( $remote_version, YAWP_VERSION, '>' ) ) {
-            $transient->response[ $this->plugin_slug ] = (object) [
-                'slug'        => 'yawp',
-                'plugin'      => $this->plugin_slug,
-                'new_version' => $remote_version,
-                'url'         => 'https://github.com/' . YAWP_GITHUB_REPO,
-                'package'     => $release['zipball_url'],
-            ];
+            $transient->response[ $this->plugin_slug ] = $item;
+        } else {
+            $transient->no_update[ $this->plugin_slug ] = $item;
         }
 
         return $transient;
@@ -90,7 +105,9 @@ class YAWP_Updater {
             $result['destination_name'] = 'yawp';
         }
 
-        activate_plugin( $this->plugin_slug );
+        // Always activate with the canonical slug — the old slug may differ
+        // after a rename (e.g. yawp-main/yawp.php → yawp/yawp.php).
+        activate_plugin( 'yawp/yawp.php' );
 
         return $result;
     }

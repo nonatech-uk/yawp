@@ -47,6 +47,9 @@ class YAWP_Backup {
         }
         set_transient( self::LOCK_KEY, time(), self::LOCK_TTL );
 
+        // Clean up any stale backup temp dirs from previous crashed runs.
+        $this->cleanup_stale_tmp_dirs();
+
         $this->healthcheck( 'start' );
 
         if ( function_exists( 'set_time_limit' ) ) {
@@ -54,11 +57,15 @@ class YAWP_Backup {
         }
 
         $timestamp = gmdate( 'Y-m-d_His' );
-        $tmp_dir   = '/tmp/yawp-backup-' . $timestamp;
+        $tmp_base  = $this->get_tmp_base();
+        $tmp_dir   = $tmp_base . '/yawp-backup-' . $timestamp;
+
+        // Register a shutdown function so temp files are cleaned even on fatal/OOM.
+        register_shutdown_function( [ $this, 'emergency_cleanup' ], $tmp_dir );
 
         try {
             // Disk space check.
-            $free = @disk_free_space( '/tmp' );
+            $free = @disk_free_space( $tmp_base );
             if ( false !== $free && $free < self::DISK_REQ ) {
                 return $this->fail( 'Insufficient disk space. Need ~400 MB, have ' . size_format( $free ) . '.' );
             }
@@ -261,7 +268,7 @@ TXT;
 
     private function build_tar_command( $type, $archive, $tmp_dir ) {
         $webroot = rtrim( get_option( 'yawp_webroot', '/var/www/html' ), '/' );
-        $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp --exclude=.git --exclude=.claude';
+        $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp --exclude=wp-content/yawp-tmp --exclude=.git --exclude=.claude';
 
         if ( 'incremental' === $type ) {
             $last = get_option( 'yawp_last_backup_time', '' );
@@ -360,5 +367,60 @@ TXT;
             }
         }
         rmdir( $dir );
+    }
+
+    /**
+     * Emergency cleanup registered as a shutdown function.
+     * Runs even on fatal errors/OOM to prevent leftover temp files
+     * from exhausting shared hosting tmpfs and crashing the site.
+     */
+    public function emergency_cleanup( $dir ) {
+        if ( is_dir( $dir ) ) {
+            $this->cleanup( $dir );
+        }
+    }
+
+    /**
+     * Remove any stale yawp-backup-* directories older than the lock TTL.
+     * Checks both /tmp and the disk-backed temp base.
+     */
+    private function cleanup_stale_tmp_dirs() {
+        $search = [ '/tmp/yawp-backup-*' ];
+        $tmp_base = $this->get_tmp_base();
+        if ( '/tmp' !== $tmp_base ) {
+            $search[] = $tmp_base . '/yawp-backup-*';
+        }
+        $cutoff = time() - self::LOCK_TTL;
+        foreach ( $search as $pattern ) {
+            $dirs = glob( $pattern );
+            if ( ! $dirs ) {
+                continue;
+            }
+            foreach ( $dirs as $dir ) {
+                if ( is_dir( $dir ) && @filemtime( $dir ) < $cutoff ) {
+                    $this->cleanup( $dir );
+                }
+            }
+        }
+    }
+
+    /**
+     * Return a disk-backed temp directory for backup staging.
+     * Avoids /tmp which may be RAM-backed (tmpfs) on shared hosting,
+     * where large archives can exhaust the cgroup memory limit.
+     */
+    private function get_tmp_base() {
+        if ( defined( 'WP_CONTENT_DIR' ) ) {
+            $dir = WP_CONTENT_DIR . '/yawp-tmp';
+            if ( ! is_dir( $dir ) ) {
+                @mkdir( $dir, 0700 );
+                @file_put_contents( $dir . '/.htaccess', "Deny from all\n" );
+                @file_put_contents( $dir . '/index.php', "<?php // silence\n" );
+            }
+            if ( is_dir( $dir ) && is_writable( $dir ) ) {
+                return $dir;
+            }
+        }
+        return '/tmp';
     }
 }
