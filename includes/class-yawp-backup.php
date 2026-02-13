@@ -330,7 +330,7 @@ TXT;
         return new WP_Error( 'yawp_backup', $message );
     }
 
-    private function healthcheck( $event, $log = '' ) {
+    public function healthcheck( $event, $log = '' ) {
         $base = rtrim( get_option( 'yawp_healthchecks_url', '' ), '/' );
         if ( empty( $base ) ) {
             return;

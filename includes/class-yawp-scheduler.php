@@ -43,7 +43,8 @@ class YAWP_Scheduler {
             return;
         }
 
-        // 4. Nothing to do — write skip marker.
+        // 4. Nothing to do — write skip marker, still ping healthchecks.
+        $backup->healthcheck( 'start' );
         $s3 = $backup->get_s3_public();
         if ( ! is_wp_error( $s3 ) ) {
             $prefix    = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
@@ -51,5 +52,6 @@ class YAWP_Scheduler {
             $key       = ( $prefix ? $prefix . '/' : '' ) . 'incremental/' . $timestamp . '.skipped';
             $s3->put_text( $key, 'No login detected. Backup skipped at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC.' );
         }
+        $backup->healthcheck( 'success', 'No login detected — backup skipped.' );
     }
 }
