@@ -12,6 +12,7 @@ class YAWP_Admin {
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
         add_action( 'wp_ajax_yawp_test_connection', [ $this, 'ajax_test_connection' ] );
         add_action( 'wp_ajax_yawp_run_backup', [ $this, 'ajax_run_backup' ] );
+        add_action( 'wp_ajax_yawp_backup_status', [ $this, 'ajax_backup_status' ] );
         add_action( 'wp_ajax_yawp_clear_lock', [ $this, 'ajax_clear_lock' ] );
         add_action( 'wp_ajax_yawp_list_backups', [ $this, 'ajax_list_backups' ] );
         add_action( 'wp_ajax_yawp_restore_backup', [ $this, 'ajax_restore_backup' ] );
@@ -122,7 +123,16 @@ class YAWP_Admin {
         if ( is_wp_error( $result ) ) {
             wp_send_json_error( $result->get_error_message() );
         }
-        wp_send_json_success( ucfirst( $type ) . ' backup completed.' );
+        // Backup is now async — just confirm it started.
+        wp_send_json_success( ucfirst( $type ) . ' backup started.' );
+    }
+
+    public function ajax_backup_status() {
+        check_ajax_referer( 'yawp_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Unauthorized.' );
+        }
+        wp_send_json_success( YAWP_Backup::get_status() );
     }
 
     public function ajax_clear_lock() {
@@ -130,7 +140,7 @@ class YAWP_Admin {
         if ( ! current_user_can( 'manage_options' ) ) {
             wp_send_json_error( 'Unauthorized.' );
         }
-        delete_transient( 'yawp_backup_running' );
+        YAWP_Backup::cancel();
         delete_transient( 'yawp_restore_running' );
         wp_send_json_success( 'Lock cleared.' );
     }
@@ -373,25 +383,98 @@ class YAWP_Admin {
                 });
             });
 
+            var pollTimer = null;
+
+            function stepLabel(step, progress) {
+                switch (step) {
+                    case 'init':     return 'Exporting database & building file list\u2026';
+                    case 'archive':  return 'Archiving files (' + (progress || '') + ')\u2026';
+                    case 'compress': return 'Compressing archive\u2026';
+                    case 'upload':   return 'Uploading to S3\u2026';
+                    case 'finish':   return 'Finalising\u2026';
+                    default:         return step + '\u2026';
+                }
+            }
+
+            function pollStatus() {
+                $.post(ajaxurl, { action: 'yawp_backup_status', nonce: nonce }, function(resp) {
+                    if (!resp.success) {
+                        stopPoll();
+                        setStatus('Status check failed.', true);
+                        enableBackupButtons();
+                        return;
+                    }
+                    var s = resp.data;
+                    if (s.running) {
+                        setStatus(stepLabel(s.step, s.progress), false);
+                    } else if (s.step === 'done') {
+                        stopPoll();
+                        setStatus(s.message || 'Backup complete!', false);
+                        enableBackupButtons();
+                        setTimeout(function() { location.reload(); }, 2000);
+                    } else if (s.step === 'error') {
+                        stopPoll();
+                        setStatus('Backup failed: ' + (s.error || 'Unknown error'), true);
+                        enableBackupButtons();
+                    } else {
+                        // Idle — no backup in progress.
+                        stopPoll();
+                        enableBackupButtons();
+                    }
+                }).fail(function() {
+                    stopPoll();
+                    setStatus('Status poll failed.', true);
+                    enableBackupButtons();
+                });
+            }
+
+            function startPoll() {
+                if (pollTimer) return;
+                pollTimer = setInterval(pollStatus, 5000);
+            }
+
+            function stopPoll() {
+                if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            }
+
+            function enableBackupButtons() {
+                $('#yawp-run-full, #yawp-run-incremental').prop('disabled', false);
+            }
+
             function runBackup(type) {
                 return function(e) {
                     e.preventDefault();
                     if (!confirm('Run ' + type + ' backup now?')) return;
-                    var $btn = $(this).prop('disabled', true);
-                    setStatus('Running ' + type + ' backup...', false);
+                    $('#yawp-run-full, #yawp-run-incremental').prop('disabled', true);
+                    setStatus('Starting ' + type + ' backup\u2026', false);
                     $.post(ajaxurl, { action: 'yawp_run_backup', nonce: nonce, backup_type: type }, function(resp) {
-                        setStatus(resp.success ? resp.data : resp.data, !resp.success);
-                        $btn.prop('disabled', false);
-                        if (resp.success) location.reload();
+                        if (resp.success) {
+                            setStatus(resp.data, false);
+                            startPoll();
+                        } else {
+                            setStatus(resp.data, true);
+                            enableBackupButtons();
+                        }
                     }).fail(function() {
                         setStatus('Request failed.', true);
-                        $btn.prop('disabled', false);
+                        enableBackupButtons();
                     });
                 };
             }
 
             $('#yawp-run-full').on('click', runBackup('full'));
             $('#yawp-run-incremental').on('click', runBackup('incremental'));
+
+            // If a backup is already running when the page loads, start polling.
+            (function checkInitialStatus() {
+                $.post(ajaxurl, { action: 'yawp_backup_status', nonce: nonce }, function(resp) {
+                    if (resp.success && resp.data && resp.data.running) {
+                        $('#yawp-run-full, #yawp-run-incremental').prop('disabled', true);
+                        setStatus(stepLabel(resp.data.step, resp.data.progress), false);
+                        startPoll();
+                    }
+                });
+            })();
 
             $('#yawp-clear-lock').on('click', function(e) {
                 e.preventDefault();

@@ -8,6 +8,15 @@ class YAWP_Scheduler {
 
     public function __construct() {
         add_action( 'yawp_daily_check', [ $this, 'daily_check' ] );
+        add_action( YAWP_Backup::CRON_HOOK, [ $this, 'run_backup_step' ] );
+    }
+
+    /**
+     * WP-Cron callback for each chunked backup step.
+     */
+    public function run_backup_step() {
+        $backup = new YAWP_Backup();
+        $backup->process_step();
     }
 
     /**
