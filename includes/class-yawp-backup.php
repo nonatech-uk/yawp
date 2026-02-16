@@ -152,9 +152,9 @@ class YAWP_Backup {
 
         $this->save_state( $state );
 
-        // Schedule the first step immediately.
-        wp_schedule_single_event( time(), self::CRON_HOOK );
-        // Also try to spawn the cron now so we don't wait for the next page load.
+        // Schedule the first step 1 s in the future so WP-Cron doesn't
+        // deduplicate it with the current request's timestamp.
+        wp_schedule_single_event( time() + 1, self::CRON_HOOK );
         spawn_cron();
 
         return true;
@@ -207,7 +207,7 @@ class YAWP_Backup {
 
         // Schedule next step if still running.
         if ( ! in_array( $state['step'], [ 'done', 'error' ], true ) ) {
-            wp_schedule_single_event( time(), self::CRON_HOOK );
+            wp_schedule_single_event( time() + 1, self::CRON_HOOK );
             spawn_cron();
         }
     }

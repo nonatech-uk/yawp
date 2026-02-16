@@ -132,7 +132,12 @@ class YAWP_Admin {
         if ( ! current_user_can( 'manage_options' ) ) {
             wp_send_json_error( 'Unauthorized.' );
         }
-        wp_send_json_success( YAWP_Backup::get_status() );
+        $status = YAWP_Backup::get_status();
+        // Nudge WP-Cron so the next step fires even on low-traffic sites.
+        if ( ! empty( $status['running'] ) ) {
+            spawn_cron();
+        }
+        wp_send_json_success( $status );
     }
 
     public function ajax_clear_lock() {
