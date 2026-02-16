@@ -12,6 +12,7 @@ class YAWP_Admin {
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_assets' ] );
         add_action( 'wp_ajax_yawp_test_connection', [ $this, 'ajax_test_connection' ] );
         add_action( 'wp_ajax_yawp_run_backup', [ $this, 'ajax_run_backup' ] );
+        add_action( 'wp_ajax_yawp_clear_lock', [ $this, 'ajax_clear_lock' ] );
         add_action( 'wp_ajax_yawp_list_backups', [ $this, 'ajax_list_backups' ] );
         add_action( 'wp_ajax_yawp_restore_backup', [ $this, 'ajax_restore_backup' ] );
     }
@@ -122,6 +123,16 @@ class YAWP_Admin {
             wp_send_json_error( $result->get_error_message() );
         }
         wp_send_json_success( ucfirst( $type ) . ' backup completed.' );
+    }
+
+    public function ajax_clear_lock() {
+        check_ajax_referer( 'yawp_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Unauthorized.' );
+        }
+        delete_transient( 'yawp_backup_running' );
+        delete_transient( 'yawp_restore_running' );
+        wp_send_json_success( 'Lock cleared.' );
     }
 
     public function ajax_list_backups() {
@@ -291,6 +302,7 @@ class YAWP_Admin {
                 <button class="button" id="yawp-test-connection">Test S3 Connection</button>
                 <button class="button button-primary" id="yawp-run-full">Run Full Backup</button>
                 <button class="button" id="yawp-run-incremental">Run Incremental Backup</button>
+                <button class="button" id="yawp-clear-lock" title="Clear stale lock if a previous backup crashed">Clear Lock</button>
                 <span id="yawp-action-status"></span>
             </div>
 
@@ -380,6 +392,18 @@ class YAWP_Admin {
 
             $('#yawp-run-full').on('click', runBackup('full'));
             $('#yawp-run-incremental').on('click', runBackup('incremental'));
+
+            $('#yawp-clear-lock').on('click', function(e) {
+                e.preventDefault();
+                var $btn = $(this).prop('disabled', true);
+                $.post(ajaxurl, { action: 'yawp_clear_lock', nonce: nonce }, function(resp) {
+                    setStatus(resp.success ? resp.data : resp.data, !resp.success);
+                    $btn.prop('disabled', false);
+                }).fail(function() {
+                    setStatus('Request failed.', true);
+                    $btn.prop('disabled', false);
+                });
+            });
 
             // ── Restore ──
 
