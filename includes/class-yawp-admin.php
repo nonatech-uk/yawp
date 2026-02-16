@@ -133,9 +133,15 @@ class YAWP_Admin {
             wp_send_json_error( 'Unauthorized.' );
         }
         $status = YAWP_Backup::get_status();
-        // Nudge WP-Cron so the next step fires even on low-traffic sites.
+        // Directly run the next step if the backup is still in progress.
+        // This makes the browser's 5-second poll the primary driver instead
+        // of relying on WP-Cron's spawn_cron() which has a 60-second lock
+        // and is unreliable on restricted shared hosting.
         if ( ! empty( $status['running'] ) ) {
-            spawn_cron();
+            $backup = new YAWP_Backup();
+            $backup->process_step();
+            // Re-read status after the step executed.
+            $status = YAWP_Backup::get_status();
         }
         wp_send_json_success( $status );
     }
