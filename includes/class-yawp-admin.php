@@ -264,8 +264,10 @@ class YAWP_Admin {
                     <tr>
                         <th><label for="yawp_webroot">WordPress Root Path</label></th>
                         <td><input type="text" id="yawp_webroot" name="yawp_webroot"
-                            value="<?php echo esc_attr( get_option( 'yawp_webroot', '/var/www/html' ) ); ?>" class="regular-text" />
-                            <p class="description">Absolute path to the WordPress installation. Default: <code>/var/www/html</code></p></td>
+                            value="<?php echo esc_attr( get_option( 'yawp_webroot', '' ) ); ?>" class="regular-text"
+                            placeholder="<?php echo esc_attr( rtrim( ABSPATH, '/' ) ); ?>" />
+                            <p class="description">Absolute path to the WordPress installation. Leave blank to auto-detect.<br>
+                            Detected: <code><?php echo esc_html( rtrim( ABSPATH, '/' ) ); ?></code></p></td>
                     </tr>
                     <tr>
                         <th><label for="yawp_full_backup_interval">Full backup every X days</label></th>

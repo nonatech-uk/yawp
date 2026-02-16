@@ -8,8 +8,20 @@ class YAWP_Backup {
 
     const LOCK_KEY       = 'yawp_backup_running';
     const LOCK_TTL       = 900; // 15 minutes
-    const DISK_REQ       = 419430400; // ~400 MB
-    const RETENTION_DAYS = 90;
+    const DISK_REQ       = 104857600; // ~100 MB (reduced — no full local archive needed)
+    const RETENTION_DAYS = 0; // 0 = no Object Lock. Set > 0 for COMPLIANCE mode retention.
+
+    /**
+     * Directories/files to exclude from backups (relative to webroot).
+     */
+    private static $excludes = [
+        'wp-content/cache',
+        'wp-content/plugins/yawp',
+        'wp-content/yawp-tmp',
+        'wp-content/object-cache.php',
+        '.git',
+        '.claude',
+    ];
 
     private $log = '';
 
@@ -67,7 +79,7 @@ class YAWP_Backup {
             // Disk space check.
             $free = @disk_free_space( $tmp_base );
             if ( false !== $free && $free < self::DISK_REQ ) {
-                return $this->fail( 'Insufficient disk space. Need ~400 MB, have ' . size_format( $free ) . '.' );
+                return $this->fail( 'Insufficient disk space. Need ~100 MB, have ' . size_format( $free ) . '.' );
             }
 
             if ( ! mkdir( $tmp_dir, 0700 ) ) {
@@ -84,24 +96,21 @@ class YAWP_Backup {
             }
             $this->log( 'Database exported (' . size_format( filesize( $db_file ) ) . ').' );
 
-            // 2. Build tar.
-            $this->log( 'Building tar archive.' );
+            // 2. Build tar archive using pure PHP (no shell tar).
+            $this->log( 'Building tar archive (PHP).' );
             $archive = $tmp_dir . '/backup.tar.gz';
-            $tar_cmd = $this->build_tar_command( $type, $archive, $tmp_dir );
-            $output  = [];
-            $retval  = 0;
-            exec( $tar_cmd . ' 2>&1', $output, $retval );
-            // Exit 1 = "file changed as we read it" — normal on a live site.
-            if ( $retval > 1 ) {
-                return $this->fail( 'tar failed (exit ' . $retval . '): ' . implode( "\n", $output ) );
+            $build   = $this->build_archive_php( $type, $archive, $db_file );
+            if ( is_wp_error( $build ) ) {
+                return $this->fail( $build->get_error_message() );
             }
 
             if ( ! file_exists( $archive ) ) {
                 return $this->fail( 'Archive was not created.' );
             }
-            $this->log( 'Archive created (' . size_format( filesize( $archive ) ) . ').' );
+            $file_size = filesize( $archive );
+            $this->log( 'Archive created (' . size_format( $file_size ) . ').' );
 
-            // 3. Upload to S3.
+            // 3. Upload to S3 (streaming multipart for any size).
             $this->log( 'Uploading to S3.' );
             $s3  = $this->get_s3();
             if ( is_wp_error( $s3 ) ) {
@@ -111,13 +120,11 @@ class YAWP_Backup {
             $prefix = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
             $s3_key = ( $prefix ? $prefix . '/' : '' ) . $type . '/' . $timestamp . '.tar.gz';
 
-            $upload = $s3->upload( $s3_key, $archive, self::RETENTION_DAYS );
+            $upload = $s3->stream_upload( $s3_key, $archive, self::RETENTION_DAYS );
             if ( is_wp_error( $upload ) ) {
                 return $this->fail( $upload->get_error_message() );
             }
             $this->log( 'Upload complete: ' . $s3_key );
-
-            $file_size = filesize( $archive );
 
             // 4. Upload README if it doesn't exist yet.
             $this->maybe_upload_readme( $s3, $prefix );
@@ -161,6 +168,177 @@ class YAWP_Backup {
             $this->cleanup( $tmp_dir );
             delete_transient( self::LOCK_KEY );
         }
+    }
+
+    /**
+     * Build a .tar.gz archive using pure PHP (PharData).
+     *
+     * This replaces the shell `tar` command which gets OOM-killed on
+     * restricted shared hosting (IONOS, GoDaddy, etc.) where external
+     * processes have tight cgroup memory limits.
+     *
+     * PharData runs inside the PHP process which already has enough
+     * memory for WordPress itself.
+     *
+     * @param string $type    'full' or 'incremental'.
+     * @param string $archive Destination .tar.gz path.
+     * @param string $db_file Path to the database.sql dump.
+     * @return true|WP_Error
+     */
+    private function build_archive_php( $type, $archive, $db_file ) {
+        $webroot = rtrim( $this->get_webroot(), '/' );
+
+        if ( ! is_dir( $webroot ) ) {
+            return new WP_Error( 'yawp_backup', 'Webroot directory does not exist: ' . $webroot );
+        }
+
+        // Incremental: only files modified since last backup.
+        $since = 0;
+        if ( 'incremental' === $type ) {
+            $last = get_option( 'yawp_last_backup_time', '' );
+            if ( $last ) {
+                $since = strtotime( $last );
+            }
+        }
+
+        // Build as .tar first, then compress. PharData needs a .tar extension.
+        $tar_path = substr( $archive, 0, -3 ); // strip .gz → .tar
+        if ( file_exists( $tar_path ) ) {
+            @unlink( $tar_path );
+        }
+        if ( file_exists( $archive ) ) {
+            @unlink( $archive );
+        }
+
+        try {
+            $phar = new PharData( $tar_path );
+
+            // Add database dump.
+            $phar->addFile( $db_file, 'database.sql' );
+
+            // Walk webroot and add files.
+            $count = 0;
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator(
+                    $webroot,
+                    RecursiveDirectoryIterator::SKIP_DOTS | RecursiveDirectoryIterator::FOLLOW_SYMLINKS
+                ),
+                RecursiveIteratorIterator::SELF_FIRST
+            );
+
+            foreach ( $iterator as $file ) {
+                $real_path = $file->getRealPath();
+                if ( false === $real_path ) {
+                    continue;
+                }
+
+                // Relative path from webroot.
+                $rel_path = ltrim( substr( $real_path, strlen( $webroot ) ), '/' );
+                if ( '' === $rel_path ) {
+                    continue;
+                }
+
+                // Check excludes.
+                if ( $this->is_excluded( $rel_path ) ) {
+                    continue;
+                }
+
+                // Skip wp-config.php (handled separately on restore).
+                if ( 'wp-config.php' === $rel_path ) {
+                    continue;
+                }
+
+                if ( $file->isDir() ) {
+                    // PharData creates directories implicitly when files
+                    // are added, but add empty dirs explicitly.
+                    $phar->addEmptyDir( $rel_path );
+                    continue;
+                }
+
+                if ( ! $file->isFile() || ! $file->isReadable() ) {
+                    continue;
+                }
+
+                // Incremental: skip files not modified since last backup.
+                if ( $since > 0 && $file->getMTime() < $since ) {
+                    continue;
+                }
+
+                $phar->addFile( $real_path, $rel_path );
+                $count++;
+
+                // Periodically free PharData internal buffers to reduce
+                // peak memory. Every 500 files, release and re-open.
+                if ( $count % 500 === 0 ) {
+                    unset( $phar );
+                    $phar = new PharData( $tar_path );
+                    $this->log( "  … archived {$count} files so far." );
+                }
+            }
+
+            unset( $phar );
+            $this->log( "Archived {$count} files total." );
+
+            // Compress .tar → .tar.gz
+            $this->log( 'Compressing archive.' );
+            $phar_compress = new PharData( $tar_path );
+            $phar_compress->compress( Phar::GZ );
+            unset( $phar_compress );
+
+            // Clean up the uncompressed .tar.
+            if ( file_exists( $tar_path ) ) {
+                @unlink( $tar_path );
+            }
+
+            if ( ! file_exists( $archive ) ) {
+                return new WP_Error( 'yawp_backup', 'gzip compression failed — .tar.gz not created.' );
+            }
+
+            return true;
+
+        } catch ( \Throwable $e ) {
+            // Clean up partial files.
+            if ( file_exists( $tar_path ) ) {
+                @unlink( $tar_path );
+            }
+            if ( file_exists( $archive ) ) {
+                @unlink( $archive );
+            }
+            return new WP_Error( 'yawp_backup', 'Archive build failed: ' . $e->getMessage() );
+        }
+    }
+
+    /**
+     * Check if a relative path matches any exclude pattern.
+     */
+    private function is_excluded( $rel_path ) {
+        foreach ( self::$excludes as $exclude ) {
+            if ( $rel_path === $exclude || 0 === strpos( $rel_path, $exclude . '/' ) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Get the effective webroot path.
+     * Uses the configured option, falling back to ABSPATH.
+     */
+    private function get_webroot() {
+        $webroot = get_option( 'yawp_webroot', '' );
+
+        // If empty or still the default placeholder, use ABSPATH.
+        if ( empty( $webroot ) || '/var/www/html' === $webroot ) {
+            if ( defined( 'ABSPATH' ) && is_dir( ABSPATH ) ) {
+                // Check if the configured value is actually valid.
+                if ( ! empty( $webroot ) && is_dir( $webroot ) ) {
+                    return $webroot;
+                }
+                return rtrim( ABSPATH, '/' );
+            }
+        }
+
+        return $webroot;
     }
 
     private function maybe_upload_readme( $s3, $prefix ) {
@@ -232,8 +410,8 @@ The IAM user needs the following permissions on this bucket:
   s3:ListMultipartUploadParts
 
 Bucket settings:
-- Object Lock: Enabled (COMPLIANCE mode, 90-day retention)
-- Versioning: Enabled (required by Object Lock)
+- Versioning: Enabled
+- Lifecycle rules: Recommended (see nonatech-uk/aws-nonatech docs)
 
 Example bucket name:  my-site-backups-123456789012
 Example prefix:       backups
@@ -258,38 +436,9 @@ YAWP runs a daily check (default 03:00 UTC). The logic:
 IMPORTANT: Incremental backups ONLY run when a WordPress user has
 logged in since the last backup. If nobody logs in, no incremental
 is created — only a .skipped marker file to confirm the job ran.
-
-Objects in this bucket are protected by S3 Object Lock (COMPLIANCE
-mode) and cannot be deleted or modified during the retention period.
 TXT;
 
         $s3->put_text( $readme_key, $readme );
-    }
-
-    private function build_tar_command( $type, $archive, $tmp_dir ) {
-        $webroot = rtrim( get_option( 'yawp_webroot', '/var/www/html' ), '/' );
-        $excludes = '--exclude=wp-content/cache --exclude=wp-content/plugins/yawp --exclude=wp-content/yawp-tmp --exclude=.git --exclude=.claude';
-
-        if ( 'incremental' === $type ) {
-            $last = get_option( 'yawp_last_backup_time', '' );
-            $newer = $last ? '--newer="' . $last . '"' : '';
-            return sprintf(
-                'tar czf %s -C %s database.sql -C %s %s %s .',
-                escapeshellarg( $archive ),
-                escapeshellarg( $tmp_dir ),
-                escapeshellarg( $webroot ),
-                $excludes,
-                $newer
-            );
-        }
-
-        return sprintf(
-            'tar czf %s -C %s database.sql -C %s %s .',
-            escapeshellarg( $archive ),
-            escapeshellarg( $tmp_dir ),
-            escapeshellarg( $webroot ),
-            $excludes
-        );
     }
 
     private function get_s3() {

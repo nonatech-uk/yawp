@@ -12,7 +12,7 @@ class YAWP_S3 {
     private $bucket;
     private $service = 's3';
 
-    const PART_SIZE = 10485760; // 10 MB
+    const PART_SIZE = 5242880; // 5 MB (minimum for S3 multipart)
     const MULTIPART_THRESHOLD = 104857600; // 100 MB
 
     public function __construct( $access_key, $secret_key, $region, $bucket ) {
@@ -51,7 +51,7 @@ class YAWP_S3 {
     /**
      * Upload a file to S3 — routes to single PUT or multipart based on size.
      */
-    public function upload( $key, $file_path, $retention_days = 90 ) {
+    public function upload( $key, $file_path, $retention_days = 0 ) {
         $size = filesize( $file_path );
         if ( $size >= self::MULTIPART_THRESHOLD ) {
             return $this->multipart_upload( $key, $file_path, $retention_days );
@@ -60,22 +60,26 @@ class YAWP_S3 {
     }
 
     /**
-     * Single PUT upload with Object Lock headers.
+     * Single PUT upload — includes Object Lock headers only when retention > 0.
+     * Pass retention_days = 0 for buckets without Object Lock.
      */
-    public function put_object( $key, $file_path, $retention_days = 90 ) {
+    public function put_object( $key, $file_path, $retention_days = 0 ) {
         $size     = filesize( $file_path );
         $sha256   = hash_file( 'sha256', $file_path );
         $md5      = base64_encode( md5_file( $file_path, true ) );
-        $retain   = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
 
         $headers = [
-            'Content-Length'                       => $size,
-            'Content-MD5'                          => $md5,
-            'Content-Type'                         => 'application/gzip',
-            'x-amz-content-sha256'                 => $sha256,
-            'x-amz-object-lock-mode'               => 'COMPLIANCE',
-            'x-amz-object-lock-retain-until-date'  => $retain,
+            'Content-Length'       => $size,
+            'Content-MD5'          => $md5,
+            'Content-Type'         => 'application/gzip',
+            'x-amz-content-sha256' => $sha256,
         ];
+
+        if ( $retention_days > 0 ) {
+            $retain = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
+            $headers['x-amz-object-lock-mode']              = 'COMPLIANCE';
+            $headers['x-amz-object-lock-retain-until-date'] = $retain;
+        }
 
         $signed = $this->sign_request( 'PUT', $this->path( $key ), $headers, $sha256 );
 
@@ -112,7 +116,7 @@ class YAWP_S3 {
     /**
      * Multipart upload for files >= 100 MB.
      */
-    public function multipart_upload( $key, $file_path, $retention_days = 90 ) {
+    public function multipart_upload( $key, $file_path, $retention_days = 0 ) {
         $upload_id = $this->initiate_multipart( $key, $retention_days );
         if ( is_wp_error( $upload_id ) ) {
             return $upload_id;
@@ -152,17 +156,78 @@ class YAWP_S3 {
         return $this->complete_multipart( $key, $upload_id, $parts );
     }
 
-    private function initiate_multipart( $key, $retention_days ) {
-        $retain = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
+    /**
+     * Stream-upload a file via multipart — reads from disk in PART_SIZE chunks.
+     * Unlike multipart_upload() this never loads the whole file into memory.
+     * Suitable for restricted shared hosting where processes get OOM-killed.
+     *
+     * Falls back to single PUT for files smaller than PART_SIZE (5 MB) since
+     * S3 multipart requires each part (except the last) to be >= 5 MB.
+     */
+    public function stream_upload( $key, $file_path, $retention_days = 0 ) {
+        $size = filesize( $file_path );
+
+        // Small files: use simple PUT (multipart overhead not worth it).
+        if ( $size < self::PART_SIZE ) {
+            return $this->put_object( $key, $file_path, $retention_days );
+        }
+
+        $upload_id = $this->initiate_multipart( $key, $retention_days );
+        if ( is_wp_error( $upload_id ) ) {
+            return $upload_id;
+        }
+
+        $fh    = fopen( $file_path, 'rb' );
+        $parts = [];
+        $part_number = 1;
+
+        try {
+            while ( ! feof( $fh ) ) {
+                $data = fread( $fh, self::PART_SIZE );
+                if ( $data === false || strlen( $data ) === 0 ) {
+                    break;
+                }
+
+                $etag = $this->upload_part( $key, $upload_id, $part_number, $data );
+                if ( is_wp_error( $etag ) ) {
+                    $this->abort_multipart( $key, $upload_id );
+                    fclose( $fh );
+                    return $etag;
+                }
+
+                $parts[] = [
+                    'PartNumber' => $part_number,
+                    'ETag'       => $etag,
+                ];
+                $part_number++;
+
+                // Free memory between parts.
+                unset( $data );
+            }
+            fclose( $fh );
+        } catch ( \Throwable $e ) {
+            fclose( $fh );
+            $this->abort_multipart( $key, $upload_id );
+            return new WP_Error( 'yawp_s3', 'Stream upload error: ' . $e->getMessage() );
+        }
+
+        return $this->complete_multipart( $key, $upload_id, $parts );
+    }
+
+    private function initiate_multipart( $key, $retention_days = 0 ) {
         $path   = $this->path( $key ) . '?uploads';
         $url    = $this->url( $key ) . '?uploads';
 
         $headers = [
-            'Content-Type'                         => 'application/gzip',
-            'x-amz-content-sha256'                 => hash( 'sha256', '' ),
-            'x-amz-object-lock-mode'               => 'COMPLIANCE',
-            'x-amz-object-lock-retain-until-date'  => $retain,
+            'Content-Type'         => 'application/gzip',
+            'x-amz-content-sha256' => hash( 'sha256', '' ),
         ];
+
+        if ( $retention_days > 0 ) {
+            $retain = gmdate( 'Y-m-d\TH:i:s\Z', time() + ( $retention_days * 86400 ) );
+            $headers['x-amz-object-lock-mode']              = 'COMPLIANCE';
+            $headers['x-amz-object-lock-retain-until-date'] = $retain;
+        }
 
         $signed = $this->sign_request( 'POST', $path, $headers, hash( 'sha256', '' ) );
 
