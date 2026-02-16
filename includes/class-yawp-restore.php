@@ -19,7 +19,7 @@ class YAWP_Restore {
     // ──────────────────────────────────────────────
 
     /**
-     * List .tar.gz backups from S3, sorted newest-first.
+     * List v2 chunked backups from S3, sorted newest-first.
      *
      * @return array|WP_Error
      */
@@ -35,39 +35,52 @@ class YAWP_Restore {
         }
 
         $backups = [];
+
+        // Find per-backup manifest.json files (not the top-level one).
         foreach ( $objects as $obj ) {
             $key = $obj['Key'];
-            if ( '.tar.gz' !== substr( $key, -7 ) ) {
+            if ( '/manifest.json' !== substr( $key, -14 ) ) {
+                continue;
+            }
+            // Skip the top-level manifest.
+            if ( $key === $prefix . 'manifest.json' ) {
                 continue;
             }
 
-            // Determine type from path: "…/full/…" or "…/incremental/…"
+            $dir = dirname( $key );
+
             $type = 'unknown';
-            if ( false !== strpos( $key, '/full/' ) ) {
+            if ( false !== strpos( $dir, '/full/' ) ) {
                 $type = 'full';
-            } elseif ( false !== strpos( $key, '/incremental/' ) ) {
+            } elseif ( false !== strpos( $dir, '/incremental/' ) ) {
                 $type = 'incremental';
             }
 
-            // Parse date from filename: YYYY-MM-DD_HHMMSS.tar.gz
-            $basename = basename( $key );
+            $basename = basename( $dir );
             $date     = '';
             if ( preg_match( '/(\d{4}-\d{2}-\d{2}_\d{6})/', $basename, $m ) ) {
                 $date = str_replace( '_', ' ', $m[1] );
-                // Format: "2025-01-15 031200" → "2025-01-15 03:12:00"
                 $date = substr( $date, 0, 13 ) . ':' . substr( $date, 13, 2 ) . ':' . substr( $date, 15, 2 );
+            }
+
+            // Sum sizes of all objects in this directory.
+            $total_size = 0;
+            foreach ( $objects as $o ) {
+                if ( 0 === strpos( $o['Key'], $dir . '/' ) ) {
+                    $total_size += $o['Size'];
+                }
             }
 
             $backups[] = [
                 's3_key'        => $key,
-                'size'          => $obj['Size'],
+                'size'          => $total_size,
                 'last_modified' => $obj['LastModified'],
                 'type'          => $type,
                 'date'          => $date,
             ];
         }
 
-        // Sort newest-first by date.
+        // Sort newest-first.
         usort( $backups, function ( $a, $b ) {
             return strcmp( $b['date'], $a['date'] );
         } );
@@ -80,16 +93,15 @@ class YAWP_Restore {
     // ──────────────────────────────────────────────
 
     /**
-     * Restore a backup archive from S3.
+     * Restore a v2 chunked backup from S3.
      *
-     * @param string $s3_key  Full S3 key of the .tar.gz archive.
-     * @param string $new_url Optional new site URL (scheme + host, no trailing slash).
+     * @param string $s3_key  Full S3 key of the manifest.json.
+     * @param string $new_url Optional new site URL.
      * @return true|WP_Error
      */
     public function restore( $s3_key, $new_url = '' ) {
         global $wpdb;
 
-        // Acquire transient lock — prevent concurrent restores.
         if ( false !== get_transient( 'yawp_restore_running' ) ) {
             return new WP_Error( 'yawp_restore', 'A restore is already in progress.' );
         }
@@ -100,82 +112,69 @@ class YAWP_Restore {
 
         @set_time_limit( 1800 );
 
-        // Disk space check — require at least 500 MB free in /tmp.
-        $free = @disk_free_space( '/tmp' );
-        if ( false !== $free && $free < 524288000 ) {
-            delete_transient( 'yawp_restore_running' );
-            return new WP_Error( 'yawp_restore', 'Insufficient disk space in /tmp (need at least 500 MB).' );
-        }
-
-        $tmp_dir      = '/tmp/yawp-restore-' . time() . '/';
-        $archive_path = $tmp_dir . 'archive.tar.gz';
+        $tmp_dir = sys_get_temp_dir() . '/yawp-restore-' . time() . '/';
 
         try {
             if ( ! mkdir( $tmp_dir, 0755, true ) ) {
                 return new WP_Error( 'yawp_restore', 'Cannot create temp directory.' );
             }
 
+            // Download and parse manifest.
+            $manifest_path = $tmp_dir . 'manifest.json';
+            $result = $this->s3->get_object( $s3_key, $manifest_path );
+            if ( is_wp_error( $result ) ) {
+                return $result;
+            }
+            $manifest = json_decode( file_get_contents( $manifest_path ), true );
+            if ( ! is_array( $manifest ) || empty( $manifest['parts'] ) || empty( $manifest['database'] ) ) {
+                return new WP_Error( 'yawp_restore', 'Invalid backup manifest.' );
+            }
+
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = "--overwrite --exclude=database.sql --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
+            $tar_excludes = "--overwrite --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
 
-            // ── Build the chain of archives to extract files from ──
-            // For an incremental: full → each incremental up to and including
-            // the selected one. Each incremental only has files changed since
-            // the previous backup, so we must layer them all in order.
-            // The DB always comes from the selected (final) archive.
-            $file_chain = $this->build_restore_chain( $s3_key );
-            if ( is_wp_error( $file_chain ) ) {
-                return $file_chain;
+            // If incremental, build the full chain (full + incrementals).
+            if ( 'incremental' === ( $manifest['type'] ?? '' ) ) {
+                $chain = $this->build_restore_chain( $s3_key );
+                if ( is_wp_error( $chain ) ) {
+                    return $chain;
+                }
+            } else {
+                $chain = [ $manifest ];
             }
 
-            // ── Download and extract files from each archive in order ──
-            foreach ( $file_chain as $i => $chain_key ) {
-                $chain_archive = $tmp_dir . 'chain_' . $i . '.tar.gz';
-                $result = $this->s3->get_object( $chain_key, $chain_archive );
-                if ( is_wp_error( $result ) ) {
-                    return $result;
-                }
+            // Extract file parts from each backup in the chain.
+            foreach ( $chain as $chain_manifest ) {
+                foreach ( $chain_manifest['parts'] as $part_key ) {
+                    $part_path = $tmp_dir . 'part.tar.gz';
+                    $result = $this->s3->get_object( $part_key, $part_path );
+                    if ( is_wp_error( $result ) ) {
+                        return $result;
+                    }
 
-                $output = [];
-                $cmd = sprintf(
-                    'tar xzf %s -C %s %s 2>&1',
-                    escapeshellarg( $chain_archive ),
-                    escapeshellarg( $webroot ),
-                    $tar_excludes
-                );
-                exec( $cmd, $output, $exit_code );
-                // Exit code 1 = non-fatal warnings (permission denied on
-                // read-only .git objects, etc). Only fail on exit code 2+.
-                if ( $exit_code >= 2 ) {
-                    return new WP_Error( 'yawp_restore', 'Failed to extract files from ' . basename( $chain_key ) . ': ' . implode( "\n", $output ) );
-                }
-
-                // Keep the last archive for DB extraction, delete the rest.
-                if ( $chain_key !== $s3_key ) {
-                    @unlink( $chain_archive );
-                } else {
-                    $archive_path = $chain_archive;
+                    $output = [];
+                    $cmd = sprintf(
+                        'tar xzf %s -C %s %s 2>&1',
+                        escapeshellarg( $part_path ),
+                        escapeshellarg( $webroot ),
+                        $tar_excludes
+                    );
+                    exec( $cmd, $output, $exit_code );
+                    if ( $exit_code >= 2 ) {
+                        return new WP_Error( 'yawp_restore', 'Failed to extract ' . basename( $part_key ) . ': ' . implode( "\n", $output ) );
+                    }
+                    @unlink( $part_path );
                 }
             }
 
-            // ── Extract database.sql (always from the selected archive) ──
-            $output = [];
-            $cmd = sprintf(
-                'tar xzf %s -C %s database.sql 2>&1',
-                escapeshellarg( $archive_path ),
-                escapeshellarg( $tmp_dir )
-            );
-            exec( $cmd, $output, $exit_code );
-            if ( 0 !== $exit_code ) {
-                return new WP_Error( 'yawp_restore', 'Failed to extract database.sql: ' . implode( "\n", $output ) );
+            // Download and import database (always from the selected backup).
+            $db_path = $tmp_dir . 'database.sql';
+            $result  = $this->s3->get_object( $manifest['database'], $db_path );
+            if ( is_wp_error( $result ) ) {
+                return $result;
             }
 
-            $sql_file = $tmp_dir . 'database.sql';
-            if ( ! file_exists( $sql_file ) ) {
-                return new WP_Error( 'yawp_restore', 'database.sql not found in archive.' );
-            }
-
-            // ── Save current YAWP settings ──
+            // Save YAWP settings.
             $saved_options = [];
             $yawp_options  = $wpdb->get_results(
                 "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE 'yawp_%'",
@@ -185,23 +184,17 @@ class YAWP_Restore {
                 $saved_options[ $row['option_name'] ] = $row['option_value'];
             }
 
-            // ── Import database.sql ──
-            $import_result = $this->import_sql( $sql_file );
+            $import_result = $this->import_sql( $db_path );
             if ( is_wp_error( $import_result ) ) {
                 return $import_result;
             }
 
-            // ── Fix legacy backups where $wpdb->_real_escape() baked
-            //    WordPress placeholder hashes into the SQL dump (% → {hash}).
-            //    Scan for any {64-char-hex} patterns and replace with %. ──
             $this->fix_placeholder_hashes();
 
-            // ── Re-apply saved YAWP settings ──
             foreach ( $saved_options as $name => $value ) {
                 update_option( $name, $value, false );
             }
 
-            // ── URL rewrite ──
             if ( '' !== $new_url ) {
                 $old_url = $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'siteurl'" );
                 if ( $old_url && $old_url !== $new_url ) {
@@ -212,13 +205,10 @@ class YAWP_Restore {
                 }
             }
 
-            // ── Flush rewrite rules ──
             delete_option( 'rewrite_rules' );
-
             return true;
 
         } finally {
-            // Cleanup.
             if ( is_dir( $tmp_dir ) ) {
                 exec( 'rm -rf ' . escapeshellarg( $tmp_dir ) );
             }
@@ -226,87 +216,82 @@ class YAWP_Restore {
         }
     }
 
-    // ──────────────────────────────────────────────
-    // Restore chain helpers
-    // ──────────────────────────────────────────────
-
     /**
-     * Build the ordered list of S3 keys to extract files from.
-     *
-     * For a full backup: just that key.
-     * For an incremental: preceding full → every incremental between that
-     * full and the selected one (inclusive), sorted oldest-first.
-     *
-     * @param string $s3_key The selected backup key.
-     * @return array|WP_Error Ordered list of S3 keys.
+     * Build ordered restore chain for incremental backups.
      */
-    private function build_restore_chain( $s3_key ) {
-        if ( false === strpos( $s3_key, '/incremental/' ) ) {
-            return [ $s3_key ];
-        }
-
+    private function build_restore_chain( $manifest_key ) {
         $backups = $this->list_backups();
         if ( is_wp_error( $backups ) ) {
             return $backups;
         }
 
-        // Sort oldest-first for chain building.
-        usort( $backups, function ( $a, $b ) {
-            return strcmp( $a['date'], $b['date'] );
-        } );
-
-        // Find the selected backup's date.
         $selected_date = '';
         foreach ( $backups as $b ) {
-            if ( $b['s3_key'] === $s3_key ) {
+            if ( $b['s3_key'] === $manifest_key ) {
                 $selected_date = $b['date'];
                 break;
             }
         }
 
         if ( '' === $selected_date ) {
-            return new WP_Error( 'yawp_restore', 'Selected backup not found in listing.' );
+            return new WP_Error( 'yawp_restore', 'Selected backup not found.' );
         }
 
-        // Find the most recent full backup that predates the selected incremental.
-        $full_key  = '';
-        $full_date = '';
+        usort( $backups, function ( $a, $b ) {
+            return strcmp( $a['date'], $b['date'] );
+        } );
+
+        // Find most recent full before selected.
+        $full_backup = null;
         foreach ( $backups as $b ) {
             if ( 'full' === $b['type'] && $b['date'] <= $selected_date ) {
-                $full_key  = $b['s3_key'];
-                $full_date = $b['date'];
+                $full_backup = $b;
             }
         }
 
-        if ( '' === $full_key ) {
-            return new WP_Error( 'yawp_restore', 'No full backup found before this incremental. Restore a full backup first.' );
+        if ( ! $full_backup ) {
+            return new WP_Error( 'yawp_restore', 'No full backup found before this incremental.' );
         }
 
-        // Build chain: full, then each incremental after the full up to
-        // and including the selected one.
-        $chain = [ $full_key ];
+        $chain = [];
+        $chain[] = $this->download_manifest( $full_backup['s3_key'] );
+
         foreach ( $backups as $b ) {
-            if ( 'incremental' === $b['type'] && $b['date'] > $full_date && $b['date'] <= $selected_date ) {
-                $chain[] = $b['s3_key'];
+            if ( 'incremental' === $b['type'] &&
+                 $b['date'] > $full_backup['date'] && $b['date'] <= $selected_date ) {
+                $chain[] = $this->download_manifest( $b['s3_key'] );
+            }
+        }
+
+        foreach ( $chain as $item ) {
+            if ( is_wp_error( $item ) ) {
+                return $item;
             }
         }
 
         return $chain;
     }
 
+    private function download_manifest( $manifest_key ) {
+        $tmp = tempnam( sys_get_temp_dir(), 'yawp-manifest-' );
+        $result = $this->s3->get_object( $manifest_key, $tmp );
+        if ( is_wp_error( $result ) ) {
+            @unlink( $tmp );
+            return $result;
+        }
+        $manifest = json_decode( file_get_contents( $tmp ), true );
+        @unlink( $tmp );
+        if ( ! is_array( $manifest ) ) {
+            return new WP_Error( 'yawp_restore', 'Invalid manifest: ' . $manifest_key );
+        }
+        return $manifest;
+    }
+
     // ──────────────────────────────────────────────
     // SQL import
     // ──────────────────────────────────────────────
 
-    /**
-     * Import a SQL dump file line-by-line, accumulating until trailing semicolon.
-     *
-     * @param string $file_path Path to .sql file.
-     * @return true|WP_Error
-     */
     private function import_sql( $file_path ) {
-        // Use raw mysqli for the entire SQL import to avoid $wpdb->query()
-        // corrupting % characters via WordPress placeholder escaping.
         $dbh = $this->get_raw_dbh();
         if ( ! $dbh ) {
             return new WP_Error( 'yawp_restore', 'Could not open database connection for SQL import.' );
@@ -323,28 +308,21 @@ class YAWP_Restore {
 
         while ( false !== ( $line = fgets( $fh ) ) ) {
             $trimmed = trim( $line );
-
-            // Skip comments and empty lines.
             if ( '' === $trimmed || 0 === strpos( $trimmed, '--' ) || 0 === strpos( $trimmed, '/*' ) ) {
                 continue;
             }
-
             $buffer .= $line;
-
-            // Execute when we hit a statement-ending semicolon.
             if ( ';' === substr( $trimmed, -1 ) ) {
                 mysqli_query( $dbh, $buffer );
                 $buffer = '';
             }
         }
 
-        // Execute any remaining buffered SQL.
         if ( '' !== trim( $buffer ) ) {
             mysqli_query( $dbh, $buffer );
         }
 
         mysqli_query( $dbh, 'SET foreign_key_checks = 1' );
-
         fclose( $fh );
         mysqli_close( $dbh );
         return true;
@@ -354,15 +332,6 @@ class YAWP_Restore {
     // URL rewrite
     // ──────────────────────────────────────────────
 
-    /**
-     * Replace all occurrences of $old_url with $new_url across the entire
-     * database using straight SQL REPLACE(). Simple and avoids WordPress's
-     * $wpdb placeholder escaping which corrupts % characters.
-     *
-     * @param string $old_url The original site URL.
-     * @param string $new_url The new site URL.
-     * @return true|WP_Error
-     */
     public function rewrite_urls( $old_url, $new_url ) {
         global $wpdb;
 
@@ -373,7 +342,6 @@ class YAWP_Restore {
             return true;
         }
 
-        // Build search/replace pairs: exact, opposite scheme, schemeless.
         $pairs = [ [ $old_url, $new_url ] ];
 
         if ( 0 === strpos( $old_url, 'https://' ) ) {
@@ -388,7 +356,6 @@ class YAWP_Restore {
             $pairs[] = [ $old_schemeless, $new_schemeless ];
         }
 
-        // Open a raw mysqli connection to avoid $wpdb corrupting % in values.
         $dbh = $this->get_raw_dbh();
         if ( ! $dbh ) {
             return new WP_Error( 'yawp_restore', 'Could not open database connection for URL rewrite.' );
@@ -425,14 +392,6 @@ class YAWP_Restore {
         return true;
     }
 
-    /**
-     * Open a raw mysqli connection using WordPress DB constants.
-     */
-    /**
-     * Fix legacy backups where $wpdb->_real_escape() wrote WordPress
-     * placeholder escape hashes into the SQL dump. These are {64-hex-char}
-     * strings that should be literal % characters.
-     */
     private function fix_placeholder_hashes() {
         $dbh = $this->get_raw_dbh();
         if ( ! $dbh ) {
@@ -450,8 +409,6 @@ class YAWP_Restore {
                 }
                 $field = $col['Field'];
 
-                // Match {64-hex-char} which is WordPress's placeholder pattern.
-                // Use REGEXP to find rows, then REPLACE the specific hash.
                 $search = mysqli_query( $dbh,
                     "SELECT DISTINCT SUBSTRING(`{$field}`, LOCATE('{', `{$field}`), 66) AS hash_str " .
                     "FROM `{$table}` WHERE `{$field}` REGEXP '\\\\{[0-9a-f]{64}\\\\}' LIMIT 1"

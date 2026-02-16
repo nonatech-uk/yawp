@@ -5,21 +5,34 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Chunked backup engine using WP-Cron steps.
+ * Chunked backup engine — no temp files persist between requests.
  *
- * Each step runs as a separate PHP request via wp_schedule_single_event(),
- * keeping execution time under shared-hosting limits (~30-60 s).
+ * IONOS shared hosting aggressively cleans up temp directories between
+ * PHP requests, so we cannot accumulate a tar archive across steps.
+ * Instead, each step creates a small tar.gz from a batch of files,
+ * uploads it directly to S3, then deletes the local copy.
  *
- * State machine: init → archive (×N) → compress → upload → finish
+ * State machine: init → archive (×N) → finish
+ *
+ * Backup format in S3:
+ *   {prefix}/{type}/{timestamp}/database.sql
+ *   {prefix}/{type}/{timestamp}/part-0001.tar.gz
+ *   {prefix}/{type}/{timestamp}/part-0002.tar.gz
+ *   ...
+ *   {prefix}/{type}/{timestamp}/manifest.json
+ *
+ * Also writes a single combined .tar.gz key to manifest for backward-
+ * compatible listing by the restore class.
  */
 class YAWP_Backup {
 
     const LOCK_KEY       = 'yawp_backup_running';
-    const LOCK_TTL       = 1800; // 30 minutes (longer now — multi-step)
+    const LOCK_TTL       = 7200; // 2 hours (large sites take time)
     const STATE_KEY      = 'yawp_backup_state';
+    const FILE_LIST_KEY  = 'yawp_backup_filelist';
     const CRON_HOOK      = 'yawp_backup_step';
     const RETENTION_DAYS = 0;
-    const BATCH_SIZE     = 100; // files per archive step
+    const BATCH_SIZE     = 200; // files per archive step
 
     /**
      * Directories/files to exclude from backups (relative to webroot).
@@ -101,14 +114,8 @@ class YAWP_Backup {
      * Cancel a running backup and clean up.
      */
     public static function cancel() {
-        $state = get_option( self::STATE_KEY, '' );
-        if ( ! empty( $state ) ) {
-            $state = json_decode( $state, true );
-            if ( is_array( $state ) && ! empty( $state['tmp_dir'] ) ) {
-                self::cleanup_dir( $state['tmp_dir'] );
-            }
-        }
         delete_option( self::STATE_KEY );
+        delete_option( self::FILE_LIST_KEY );
         delete_transient( self::LOCK_KEY );
         wp_clear_scheduled_hook( self::CRON_HOOK );
     }
@@ -123,37 +130,27 @@ class YAWP_Backup {
         }
         set_transient( self::LOCK_KEY, time(), self::LOCK_TTL );
 
-        // Clean up any stale temp dirs.
-        $this->cleanup_stale_tmp_dirs();
-
         $this->healthcheck( 'start' );
 
         $timestamp = gmdate( 'Y-m-d_His' );
-        $tmp_base  = $this->get_tmp_base();
-        $tmp_dir   = $tmp_base . '/yawp-backup-' . $timestamp;
-
-        $prefix = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
-        $s3_key = ( $prefix ? $prefix . '/' : '' ) . $type . '/' . $timestamp . '.tar.gz';
+        $prefix    = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
+        $s3_dir    = ( $prefix ? $prefix . '/' : '' ) . $type . '/' . $timestamp;
 
         $state = [
             'step'        => 'init',
             'type'        => $type,
             'timestamp'   => $timestamp,
-            'tmp_dir'     => $tmp_dir,
-            'tar_path'    => $tmp_dir . '/backup.tar',
-            'archive_path'=> $tmp_dir . '/backup.tar.gz',
-            'db_file'     => $tmp_dir . '/database.sql',
-            'file_list'   => $tmp_dir . '/filelist.txt',
+            's3_dir'      => $s3_dir,
             'file_cursor' => 0,
             'file_count'  => 0,
-            's3_key'      => $s3_key,
+            'part_num'    => 0,
+            'total_size'  => 0,
             'log'         => '',
         ];
 
         $this->save_state( $state );
 
-        // Schedule the first step 1 s in the future so WP-Cron doesn't
-        // deduplicate it with the current request's timestamp.
+        // Schedule the first step.
         wp_schedule_single_event( time() + 1, self::CRON_HOOK );
         spawn_cron();
 
@@ -165,8 +162,8 @@ class YAWP_Backup {
     // ──────────────────────────────────────────────
 
     /**
-     * Called by WP-Cron. Reads state, executes current step, saves state,
-     * schedules next step.
+     * Called by WP-Cron or directly from the status poll AJAX.
+     * Reads state, executes current step, saves state.
      */
     public function process_step() {
         $state = $this->load_state();
@@ -186,12 +183,6 @@ class YAWP_Backup {
                 case 'archive':
                     $state = $this->step_archive( $state );
                     break;
-                case 'compress':
-                    $state = $this->step_compress( $state );
-                    break;
-                case 'upload':
-                    $state = $this->step_upload( $state );
-                    break;
                 case 'finish':
                     $state = $this->step_finish( $state );
                     break;
@@ -205,7 +196,7 @@ class YAWP_Backup {
 
         $this->save_state( $state );
 
-        // Schedule next step if still running.
+        // Schedule next step as fallback for unattended cron runs.
         if ( ! in_array( $state['step'], [ 'done', 'error' ], true ) ) {
             wp_schedule_single_event( time() + 1, self::CRON_HOOK );
             spawn_cron();
@@ -219,19 +210,33 @@ class YAWP_Backup {
     private function step_init( $state ) {
         $state = $this->log_state( $state, 'Starting ' . $state['type'] . ' backup.' );
 
-        $tmp_dir = $state['tmp_dir'];
-        if ( ! mkdir( $tmp_dir, 0700, true ) ) {
-            return $this->fail_state( $state, 'Cannot create temp directory.' );
-        }
-
-        // Export database.
+        // Export database to a temp file, upload to S3, delete local.
         $state = $this->log_state( $state, 'Exporting database.' );
+        $db_tmp = tempnam( sys_get_temp_dir(), 'yawp-db-' );
         $exporter = new YAWP_DB_Export();
-        $result   = $exporter->export( $state['db_file'] );
+        $result   = $exporter->export( $db_tmp );
         if ( is_wp_error( $result ) ) {
+            @unlink( $db_tmp );
             return $this->fail_state( $state, $result->get_error_message() );
         }
-        $state = $this->log_state( $state, 'Database exported (' . size_format( filesize( $state['db_file'] ) ) . ').' );
+
+        $db_size = filesize( $db_tmp );
+        $state = $this->log_state( $state, 'Database exported (' . size_format( $db_size ) . ').' );
+
+        // Upload database dump to S3.
+        $s3 = $this->get_s3();
+        if ( is_wp_error( $s3 ) ) {
+            @unlink( $db_tmp );
+            return $this->fail_state( $state, $s3->get_error_message() );
+        }
+
+        $db_key = $state['s3_dir'] . '/database.sql';
+        $upload = $s3->stream_upload( $db_key, $db_tmp, self::RETENTION_DAYS );
+        @unlink( $db_tmp );
+        if ( is_wp_error( $upload ) ) {
+            return $this->fail_state( $state, 'DB upload failed: ' . $upload->get_error_message() );
+        }
+        $state = $this->log_state( $state, 'Database uploaded to S3.' );
 
         // Build file list.
         $state = $this->log_state( $state, 'Building file list.' );
@@ -277,7 +282,7 @@ class YAWP_Backup {
             }
 
             if ( $file->isDir() ) {
-                continue; // PharData creates dirs implicitly.
+                continue;
             }
 
             if ( ! $file->isFile() || ! $file->isReadable() ) {
@@ -294,21 +299,14 @@ class YAWP_Backup {
         $count = count( $file_list );
         $state = $this->log_state( $state, "Found {$count} files to archive." );
 
-        // Save file list to temp file (avoid bloating wp_options).
-        $bytes = file_put_contents( $state['file_list'], implode( "\n", $file_list ) );
-        if ( false === $bytes || ! file_exists( $state['file_list'] ) ) {
-            return $this->fail_state( $state, 'Failed to write file list to ' . $state['file_list'] );
-        }
-        $state = $this->log_state( $state, 'File list written (' . size_format( $bytes ) . ').' );
-
-        // Create initial tar with just the database dump.
-        $phar = new PharData( $state['tar_path'] );
-        $phar->addFile( $state['db_file'], 'database.sql' );
-        unset( $phar );
+        // Store file list in wp_options (database is the only reliable
+        // persistent storage on IONOS — temp dirs get cleaned between requests).
+        update_option( self::FILE_LIST_KEY, wp_json_encode( $file_list ), false );
 
         $state['file_cursor'] = 0;
         $state['file_count']  = $count;
         $state['webroot']     = $webroot;
+        $state['total_size']  = $db_size;
         $state['step']        = 'archive';
 
         return $state;
@@ -320,121 +318,141 @@ class YAWP_Backup {
         $webroot = $state['webroot'];
 
         if ( $cursor >= $count ) {
-            $state['step'] = 'compress';
-            $state = $this->log_state( $state, 'All files archived.' );
+            $state['step'] = 'finish';
+            $state = $this->log_state( $state, 'All files archived and uploaded.' );
             return $state;
         }
 
-        // Read file list from temp file.
-        $list_path = $state['file_list'];
-        if ( ! file_exists( $list_path ) ) {
-            return $this->fail_state( $state, 'File list missing: ' . $list_path . ' (tmp_dir exists: ' . ( is_dir( $state['tmp_dir'] ) ? 'yes' : 'no' ) . ')' );
+        // Read file list from wp_options.
+        $raw = get_option( self::FILE_LIST_KEY, '' );
+        if ( empty( $raw ) ) {
+            return $this->fail_state( $state, 'File list not found in database.' );
         }
-        $all_files = file( $list_path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
-        if ( false === $all_files ) {
-            return $this->fail_state( $state, 'Cannot read file list: ' . $list_path . ' (size: ' . filesize( $list_path ) . ')' );
+        $all_files = json_decode( $raw, true );
+        if ( ! is_array( $all_files ) ) {
+            return $this->fail_state( $state, 'File list corrupted in database.' );
         }
 
         $batch_end = min( $cursor + self::BATCH_SIZE, $count );
         $batch = array_slice( $all_files, $cursor, self::BATCH_SIZE );
 
-        $phar = new PharData( $state['tar_path'] );
-        $added = 0;
+        // Create a small tar.gz for this batch in PHP's temp directory.
+        $part_num = $state['part_num'] + 1;
+        $tar_tmp  = tempnam( sys_get_temp_dir(), 'yawp-part-' );
 
-        foreach ( $batch as $rel_path ) {
-            $full_path = $webroot . '/' . $rel_path;
-            if ( ! is_file( $full_path ) || ! is_readable( $full_path ) ) {
-                continue; // File may have been deleted since list was built.
+        // PharData needs a .tar extension.
+        $tar_path = $tar_tmp . '.tar';
+        rename( $tar_tmp, $tar_path );
+
+        try {
+            $phar  = new PharData( $tar_path );
+            $added = 0;
+
+            foreach ( $batch as $rel_path ) {
+                $full_path = $webroot . '/' . $rel_path;
+                if ( ! is_file( $full_path ) || ! is_readable( $full_path ) ) {
+                    continue;
+                }
+                try {
+                    $phar->addFile( $full_path, $rel_path );
+                    $added++;
+                } catch ( \Throwable $e ) {
+                    continue;
+                }
             }
-            try {
-                $phar->addFile( $full_path, $rel_path );
-                $added++;
-            } catch ( \Throwable $e ) {
-                // Skip individual file errors (permissions, etc.)
-                continue;
+
+            unset( $phar );
+
+            if ( 0 === $added ) {
+                // Nothing to upload — skip this batch.
+                @unlink( $tar_path );
+                $state['file_cursor'] = $batch_end;
+                $state = $this->log_state( $state, "Batch {$cursor}-{$batch_end}: 0 files (all skipped)." );
+                return $state;
             }
+
+            // Compress to .tar.gz.
+            $phar = new PharData( $tar_path );
+            $phar->compress( Phar::GZ );
+            unset( $phar );
+
+            $gz_path = $tar_path . '.gz';
+            @unlink( $tar_path ); // Remove uncompressed tar.
+
+            if ( ! file_exists( $gz_path ) ) {
+                return $this->fail_state( $state, "Compression failed for batch starting at {$cursor}." );
+            }
+
+            $part_size = filesize( $gz_path );
+
+            // Upload this part to S3.
+            $s3 = $this->get_s3();
+            if ( is_wp_error( $s3 ) ) {
+                @unlink( $gz_path );
+                return $this->fail_state( $state, $s3->get_error_message() );
+            }
+
+            $part_key = sprintf( '%s/part-%04d.tar.gz', $state['s3_dir'], $part_num );
+            $upload   = $s3->stream_upload( $part_key, $gz_path, self::RETENTION_DAYS );
+            @unlink( $gz_path );
+
+            if ( is_wp_error( $upload ) ) {
+                return $this->fail_state( $state, 'Upload failed for part ' . $part_num . ': ' . $upload->get_error_message() );
+            }
+
+            $state['file_cursor'] = $batch_end;
+            $state['part_num']    = $part_num;
+            $state['total_size'] += $part_size;
+            $state = $this->log_state( $state, "Part {$part_num}: files {$cursor}-{$batch_end} ({$added} added, " . size_format( $part_size ) . ').' );
+
+        } catch ( \Throwable $e ) {
+            @unlink( $tar_path );
+            @unlink( $tar_path . '.gz' );
+            return $this->fail_state( $state, 'Archive step exception: ' . $e->getMessage() );
         }
 
-        unset( $phar );
-
-        $state['file_cursor'] = $batch_end;
-        $state = $this->log_state( $state, "Archived files {$cursor}-{$batch_end} of {$count} ({$added} added)." );
-
-        // Stay on 'archive' step — will loop back.
-        return $state;
-    }
-
-    private function step_compress( $state ) {
-        $state = $this->log_state( $state, 'Compressing archive.' );
-
-        $tar_path     = $state['tar_path'];
-        $archive_path = $state['archive_path'];
-
-        if ( ! file_exists( $tar_path ) ) {
-            return $this->fail_state( $state, 'Tar file not found for compression.' );
-        }
-
-        // Remove any prior .tar.gz.
-        if ( file_exists( $archive_path ) ) {
-            @unlink( $archive_path );
-        }
-
-        $phar = new PharData( $tar_path );
-        $phar->compress( Phar::GZ );
-        unset( $phar );
-
-        // Clean up uncompressed tar.
-        @unlink( $tar_path );
-
-        if ( ! file_exists( $archive_path ) ) {
-            return $this->fail_state( $state, 'Compression failed — .tar.gz not created.' );
-        }
-
-        $size = filesize( $archive_path );
-        $state = $this->log_state( $state, 'Archive compressed (' . size_format( $size ) . ').' );
-        $state['archive_size'] = $size;
-        $state['step'] = 'upload';
-
-        return $state;
-    }
-
-    private function step_upload( $state ) {
-        $state = $this->log_state( $state, 'Uploading to S3.' );
-
-        $s3 = $this->get_s3();
-        if ( is_wp_error( $s3 ) ) {
-            return $this->fail_state( $state, $s3->get_error_message() );
-        }
-
-        $upload = $s3->stream_upload( $state['s3_key'], $state['archive_path'], self::RETENTION_DAYS );
-        if ( is_wp_error( $upload ) ) {
-            return $this->fail_state( $state, $upload->get_error_message() );
-        }
-
-        $state = $this->log_state( $state, 'Upload complete: ' . $state['s3_key'] );
-
-        // Upload README if needed.
-        $prefix = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
-        $this->maybe_upload_readme( $s3, $prefix );
-
-        $state['step'] = 'finish';
         return $state;
     }
 
     private function step_finish( $state ) {
         $s3 = $this->get_s3();
 
-        // Update manifest.
+        // Build and upload manifest for this backup.
+        $parts = [];
+        for ( $i = 1; $i <= $state['part_num']; $i++ ) {
+            $parts[] = sprintf( '%s/part-%04d.tar.gz', $state['s3_dir'], $i );
+        }
+
+        $manifest = [
+            'version'    => 2,
+            'type'       => $state['type'],
+            'timestamp'  => $state['timestamp'],
+            'file_count' => $state['file_count'],
+            'part_count' => $state['part_num'],
+            'total_size' => $state['total_size'],
+            'database'   => $state['s3_dir'] . '/database.sql',
+            'parts'      => $parts,
+        ];
+
         if ( ! is_wp_error( $s3 ) ) {
+            // Upload backup manifest.
+            $manifest_key = $state['s3_dir'] . '/manifest.json';
+            $s3->put_text( $manifest_key, wp_json_encode( $manifest, JSON_PRETTY_PRINT ) );
+
+            // Also write the top-level manifest for backward compat.
             $prefix = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
-            $manifest_key = ( $prefix ? $prefix . '/' : '' ) . 'manifest.json';
-            $manifest = [
+            $top_manifest_key = ( $prefix ? $prefix . '/' : '' ) . 'manifest.json';
+            $top_manifest = [
                 'last_backup'  => $state['timestamp'],
                 'last_type'    => $state['type'],
-                'last_s3_key'  => $state['s3_key'],
-                'last_size'    => $state['archive_size'] ?? 0,
+                'last_s3_key'  => $state['s3_dir'] . '/manifest.json',
+                'last_size'    => $state['total_size'],
+                'format'       => 'chunked-v2',
             ];
-            $s3->put_json( $manifest_key, wp_json_encode( $manifest ) );
+            $s3->put_json( $top_manifest_key, wp_json_encode( $top_manifest ) );
+
+            // Upload README if needed.
+            $this->maybe_upload_readme( $s3, $prefix );
         }
 
         // Record in wp_options.
@@ -447,18 +465,19 @@ class YAWP_Backup {
         $this->add_history_entry( [
             'date'   => $now,
             'type'   => $state['type'],
-            'size'   => $state['archive_size'] ?? 0,
-            's3_key' => $state['s3_key'],
+            'size'   => $state['total_size'],
+            's3_key' => $state['s3_dir'] . '/',
             'status' => 'success',
         ]);
 
         delete_option( 'yawp_last_error' );
 
-        $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully.' );
+        // Clean up file list from wp_options.
+        delete_option( self::FILE_LIST_KEY );
+
+        $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully (' . $state['part_num'] . ' parts, ' . size_format( $state['total_size'] ) . ').' );
         $this->healthcheck( 'success', $state['log'] );
 
-        // Clean up.
-        self::cleanup_dir( $state['tmp_dir'] );
         delete_transient( self::LOCK_KEY );
 
         $state['step'] = 'done';
@@ -483,7 +502,12 @@ class YAWP_Backup {
     }
 
     private function log_state( $state, $message ) {
-        $state['log'] .= '[' . gmdate( 'Y-m-d H:i:s' ) . '] ' . $message . "\n";
+        // Keep log from growing too large (trim to last 10 KB).
+        $entry = '[' . gmdate( 'Y-m-d H:i:s' ) . '] ' . $message . "\n";
+        $state['log'] .= $entry;
+        if ( strlen( $state['log'] ) > 10000 ) {
+            $state['log'] = "…(trimmed)\n" . substr( $state['log'], -9000 );
+        }
         return $state;
     }
 
@@ -503,10 +527,8 @@ class YAWP_Backup {
             'status' => $message,
         ]);
 
-        // Clean up temp files.
-        if ( ! empty( $state['tmp_dir'] ) ) {
-            self::cleanup_dir( $state['tmp_dir'] );
-        }
+        // Clean up.
+        delete_option( self::FILE_LIST_KEY );
         delete_transient( self::LOCK_KEY );
 
         return $state;
@@ -581,59 +603,6 @@ class YAWP_Backup {
         ] );
     }
 
-    private static function cleanup_dir( $dir ) {
-        if ( ! is_dir( $dir ) ) {
-            return;
-        }
-        $files = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
-            RecursiveIteratorIterator::CHILD_FIRST
-        );
-        foreach ( $files as $file ) {
-            if ( $file->isDir() ) {
-                @rmdir( $file->getRealPath() );
-            } else {
-                @unlink( $file->getRealPath() );
-            }
-        }
-        @rmdir( $dir );
-    }
-
-    private function cleanup_stale_tmp_dirs() {
-        $search = [ '/tmp/yawp-backup-*' ];
-        $tmp_base = $this->get_tmp_base();
-        if ( '/tmp' !== $tmp_base ) {
-            $search[] = $tmp_base . '/yawp-backup-*';
-        }
-        $cutoff = time() - self::LOCK_TTL;
-        foreach ( $search as $pattern ) {
-            $dirs = glob( $pattern );
-            if ( ! $dirs ) {
-                continue;
-            }
-            foreach ( $dirs as $dir ) {
-                if ( is_dir( $dir ) && @filemtime( $dir ) < $cutoff ) {
-                    self::cleanup_dir( $dir );
-                }
-            }
-        }
-    }
-
-    private function get_tmp_base() {
-        if ( defined( 'WP_CONTENT_DIR' ) ) {
-            $dir = WP_CONTENT_DIR . '/yawp-tmp';
-            if ( ! is_dir( $dir ) ) {
-                @mkdir( $dir, 0700 );
-                @file_put_contents( $dir . '/.htaccess', "Deny from all\n" );
-                @file_put_contents( $dir . '/index.php', "<?php // silence\n" );
-            }
-            if ( is_dir( $dir ) && is_writable( $dir ) ) {
-                return $dir;
-            }
-        }
-        return '/tmp';
-    }
-
     private function maybe_upload_readme( $s3, $prefix ) {
         $readme_key = ( $prefix ? $prefix . '/' : '' ) . 'README.txt';
 
@@ -660,17 +629,17 @@ https://github.com/nonatech-uk/yawp
 Source site: {$siteurl}
 Created:     {$date}
 
-Structure
----------
-{$pfx}/full/YYYY-MM-DD_HHMMSS.tar.gz         Full site backup
-{$pfx}/incremental/YYYY-MM-DD_HHMMSS.tar.gz   Incremental (changed files + full DB)
-{$pfx}/incremental/YYYY-MM-DD_HHMMSS.skipped  Marker — scheduled job ran, no changes detected
-{$pfx}/manifest.json                           Last backup metadata
-{$pfx}/README.txt                              This file
+Structure (v2 — chunked)
+------------------------
+{$pfx}/{type}/{timestamp}/database.sql          Full database dump
+{$pfx}/{type}/{timestamp}/part-0001.tar.gz      File archive part 1
+{$pfx}/{type}/{timestamp}/part-0002.tar.gz      File archive part 2
+  ...
+{$pfx}/{type}/{timestamp}/manifest.json         Backup manifest (lists all parts)
+{$pfx}/manifest.json                            Last backup metadata
 
-Each .tar.gz archive contains:
-- database.sql        Full database dump
-- ./                  WordPress webroot files (relative paths)
+Each part-*.tar.gz contains a subset of the WordPress webroot files
+(relative paths). Extract all parts in order to reconstruct the full site.
 
 Excluded from archives:
 - wp-config.php              Preserves target site's DB credentials and salts
