@@ -295,7 +295,11 @@ class YAWP_Backup {
         $state = $this->log_state( $state, "Found {$count} files to archive." );
 
         // Save file list to temp file (avoid bloating wp_options).
-        file_put_contents( $state['file_list'], implode( "\n", $file_list ) );
+        $bytes = file_put_contents( $state['file_list'], implode( "\n", $file_list ) );
+        if ( false === $bytes || ! file_exists( $state['file_list'] ) ) {
+            return $this->fail_state( $state, 'Failed to write file list to ' . $state['file_list'] );
+        }
+        $state = $this->log_state( $state, 'File list written (' . size_format( $bytes ) . ').' );
 
         // Create initial tar with just the database dump.
         $phar = new PharData( $state['tar_path'] );
@@ -322,9 +326,13 @@ class YAWP_Backup {
         }
 
         // Read file list from temp file.
-        $all_files = file( $state['file_list'], FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
+        $list_path = $state['file_list'];
+        if ( ! file_exists( $list_path ) ) {
+            return $this->fail_state( $state, 'File list missing: ' . $list_path . ' (tmp_dir exists: ' . ( is_dir( $state['tmp_dir'] ) ? 'yes' : 'no' ) . ')' );
+        }
+        $all_files = file( $list_path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES );
         if ( false === $all_files ) {
-            return $this->fail_state( $state, 'Cannot read file list.' );
+            return $this->fail_state( $state, 'Cannot read file list: ' . $list_path . ' (size: ' . filesize( $list_path ) . ')' );
         }
 
         $batch_end = min( $cursor + self::BATCH_SIZE, $count );
