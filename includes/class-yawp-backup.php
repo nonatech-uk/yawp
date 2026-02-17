@@ -33,6 +33,7 @@ class YAWP_Backup {
     const CRON_HOOK      = 'yawp_backup_step';
     const RETENTION_DAYS = 0;
     const BATCH_SIZE     = 200; // files per archive step
+    const MAX_FILE_SIZE  = 52428800; // 50 MB — skip larger files to avoid PharData truncation
 
     /**
      * Directories/files to exclude from backups (relative to webroot).
@@ -44,6 +45,7 @@ class YAWP_Backup {
         'wp-content/object-cache.php',
         '.git',
         '.claude',
+        '.opcache',
     ];
 
     // ──────────────────────────────────────────────
@@ -115,9 +117,22 @@ class YAWP_Backup {
      */
     public static function cancel() {
         delete_option( self::STATE_KEY );
-        delete_option( self::FILE_LIST_KEY );
+        self::delete_file_list_chunks();
         delete_transient( self::LOCK_KEY );
         wp_clear_scheduled_hook( self::CRON_HOOK );
+    }
+
+    /**
+     * Delete all chunked file list options from the database.
+     */
+    private static function delete_file_list_chunks() {
+        $num_chunks = (int) get_option( self::FILE_LIST_KEY . '_chunks', 0 );
+        for ( $i = 0; $i < $num_chunks; $i++ ) {
+            delete_option( self::FILE_LIST_KEY . '_' . $i );
+        }
+        delete_option( self::FILE_LIST_KEY . '_chunks' );
+        // Also delete legacy single-blob key in case it exists.
+        delete_option( self::FILE_LIST_KEY );
     }
 
     // ──────────────────────────────────────────────
@@ -169,6 +184,12 @@ class YAWP_Backup {
         $state = $this->load_state();
         if ( ! $state ) {
             return; // No backup in progress.
+        }
+
+        // Already finished — don't run again (prevents duplicate history
+        // entries when both AJAX poll and WP-Cron fire simultaneously).
+        if ( in_array( $state['step'], [ 'done', 'error' ], true ) ) {
+            return;
         }
 
         if ( function_exists( 'set_time_limit' ) ) {
@@ -299,9 +320,16 @@ class YAWP_Backup {
         $count = count( $file_list );
         $state = $this->log_state( $state, "Found {$count} files to archive." );
 
-        // Store file list in wp_options (database is the only reliable
-        // persistent storage on IONOS — temp dirs get cleaned between requests).
-        update_option( self::FILE_LIST_KEY, wp_json_encode( $file_list ), false );
+        // Store file list in per-batch chunks in wp_options.
+        // One giant 53k-entry JSON blob exceeds MySQL limits on shared hosting,
+        // and decoding it every 5-second poll is too slow. Each chunk holds one
+        // batch worth of files so the archive step only reads what it needs.
+        $chunks     = array_chunk( $file_list, self::BATCH_SIZE );
+        $num_chunks = count( $chunks );
+        for ( $i = 0; $i < $num_chunks; $i++ ) {
+            update_option( self::FILE_LIST_KEY . '_' . $i, wp_json_encode( $chunks[ $i ] ), false );
+        }
+        update_option( self::FILE_LIST_KEY . '_chunks', $num_chunks, false );
 
         $state['file_cursor'] = 0;
         $state['file_count']  = $count;
@@ -323,67 +351,72 @@ class YAWP_Backup {
             return $state;
         }
 
-        // Read file list from wp_options.
-        $raw = get_option( self::FILE_LIST_KEY, '' );
+        // Read only this batch's chunk from wp_options (not the entire file list).
+        $chunk_index = intdiv( $cursor, self::BATCH_SIZE );
+        $raw = get_option( self::FILE_LIST_KEY . '_' . $chunk_index, '' );
         if ( empty( $raw ) ) {
-            return $this->fail_state( $state, 'File list not found in database.' );
+            return $this->fail_state( $state, 'File list chunk ' . $chunk_index . ' not found in database.' );
         }
-        $all_files = json_decode( $raw, true );
-        if ( ! is_array( $all_files ) ) {
-            return $this->fail_state( $state, 'File list corrupted in database.' );
+        $batch = json_decode( $raw, true );
+        if ( ! is_array( $batch ) ) {
+            return $this->fail_state( $state, 'File list chunk ' . $chunk_index . ' corrupted.' );
         }
 
-        $batch_end = min( $cursor + self::BATCH_SIZE, $count );
-        $batch = array_slice( $all_files, $cursor, self::BATCH_SIZE );
+        $batch_end = min( $cursor + count( $batch ), $count );
 
-        // Create a small tar.gz for this batch in PHP's temp directory.
+        // Build tar in memory (no PharData — it corrupts on IONOS shared hosting).
         $part_num = $state['part_num'] + 1;
-        $tar_tmp  = tempnam( sys_get_temp_dir(), 'yawp-part-' );
-
-        // PharData needs a .tar extension.
-        $tar_path = $tar_tmp . '.tar';
-        rename( $tar_tmp, $tar_path );
 
         try {
-            $phar  = new PharData( $tar_path );
-            $added = 0;
+            $tar_data = '';
+            $added    = 0;
+            $skipped  = 0;
 
             foreach ( $batch as $rel_path ) {
                 $full_path = $webroot . '/' . $rel_path;
                 if ( ! is_file( $full_path ) || ! is_readable( $full_path ) ) {
                     continue;
                 }
-                try {
-                    $phar->addFile( $full_path, $rel_path );
-                    $added++;
-                } catch ( \Throwable $e ) {
+                $fsize = @filesize( $full_path );
+                if ( false === $fsize || $fsize > self::MAX_FILE_SIZE ) {
+                    $skipped++;
                     continue;
                 }
+                $contents = @file_get_contents( $full_path );
+                if ( false === $contents ) {
+                    $skipped++;
+                    continue;
+                }
+                $entry = $this->tar_entry( $rel_path, $contents );
+                unset( $contents );
+                if ( '' === $entry ) {
+                    $skipped++; // Path too long for ustar.
+                    continue;
+                }
+                $tar_data .= $entry;
+                $added++;
             }
 
-            unset( $phar );
-
             if ( 0 === $added ) {
-                // Nothing to upload — skip this batch.
-                @unlink( $tar_path );
                 $state['file_cursor'] = $batch_end;
-                $state = $this->log_state( $state, "Batch {$cursor}-{$batch_end}: 0 files (all skipped)." );
+                $state = $this->log_state( $state, "Batch {$cursor}-{$batch_end}: 0 files (all skipped, {$skipped} oversize/unreadable)." );
                 return $state;
             }
 
-            // Compress to .tar.gz.
-            $phar = new PharData( $tar_path );
-            $phar->compress( Phar::GZ );
-            unset( $phar );
+            // Two 512-byte null blocks = end-of-archive marker.
+            $tar_data .= pack( 'a1024', '' );
 
-            $gz_path = $tar_path . '.gz';
-            @unlink( $tar_path ); // Remove uncompressed tar.
+            $gz_data = gzencode( $tar_data, 6 );
+            unset( $tar_data );
 
-            if ( ! file_exists( $gz_path ) ) {
+            if ( false === $gz_data ) {
                 return $this->fail_state( $state, "Compression failed for batch starting at {$cursor}." );
             }
 
-            $part_size = filesize( $gz_path );
+            $gz_path = tempnam( sys_get_temp_dir(), 'yawp-gz-' );
+            file_put_contents( $gz_path, $gz_data );
+            $part_size = strlen( $gz_data );
+            unset( $gz_data );
 
             // Upload this part to S3.
             $s3 = $this->get_s3();
@@ -406,8 +439,6 @@ class YAWP_Backup {
             $state = $this->log_state( $state, "Part {$part_num}: files {$cursor}-{$batch_end} ({$added} added, " . size_format( $part_size ) . ').' );
 
         } catch ( \Throwable $e ) {
-            @unlink( $tar_path );
-            @unlink( $tar_path . '.gz' );
             return $this->fail_state( $state, 'Archive step exception: ' . $e->getMessage() );
         }
 
@@ -472,8 +503,8 @@ class YAWP_Backup {
 
         delete_option( 'yawp_last_error' );
 
-        // Clean up file list from wp_options.
-        delete_option( self::FILE_LIST_KEY );
+        // Clean up file list chunks from wp_options.
+        self::delete_file_list_chunks();
 
         $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully (' . $state['part_num'] . ' parts, ' . size_format( $state['total_size'] ) . ').' );
         $this->healthcheck( 'success', $state['log'] );
@@ -528,7 +559,7 @@ class YAWP_Backup {
         ]);
 
         // Clean up.
-        delete_option( self::FILE_LIST_KEY );
+        self::delete_file_list_chunks();
         delete_transient( self::LOCK_KEY );
 
         return $state;
@@ -537,6 +568,66 @@ class YAWP_Backup {
     // ──────────────────────────────────────────────
     // Helpers
     // ──────────────────────────────────────────────
+
+    /**
+     * Build a single POSIX/ustar tar entry (header + data) in memory.
+     *
+     * Returns a binary string that can be concatenated to form a valid tar.
+     * No temp files, no PharData — immune to IONOS temp-dir corruption.
+     */
+    private function tar_entry( $name, $data ) {
+        $size = strlen( $data );
+
+        // ustar supports prefix (155) + name (100) = 255 chars max.
+        // Split long paths at a '/' boundary into prefix + name.
+        $prefix = '';
+        if ( strlen( $name ) > 100 ) {
+            // Find last '/' that leaves name <= 100 and prefix <= 155.
+            $split = strrpos( substr( $name, 0, strlen( $name ) - 1 ), '/' );
+            if ( false !== $split && $split <= 155 && ( strlen( $name ) - $split - 1 ) <= 100 ) {
+                $prefix = substr( $name, 0, $split );
+                $name   = substr( $name, $split + 1 );
+            } else {
+                // Path too long for ustar — skip this file.
+                return '';
+            }
+        }
+
+        // Tar header: 512 bytes, ustar format.
+        $header = pack(
+            'a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12',
+            $name,                          // name (100)
+            '0000644',                      // mode (8)
+            '0000000',                      // uid (8)
+            '0000000',                      // gid (8)
+            sprintf( '%011o', $size ),      // size in octal (12)
+            sprintf( '%011o', time() ),     // mtime in octal (12)
+            '        ',                     // checksum placeholder — 8 spaces (8)
+            '0',                            // typeflag: regular file (1)
+            '',                             // linkname (100)
+            'ustar',                        // magic (6)
+            '00',                           // version (2)
+            '',                             // uname (32)
+            '',                             // gname (32)
+            '',                             // devmajor (8)
+            '',                             // devminor (8)
+            $prefix,                        // prefix (155)
+            ''                              // padding (12)
+        );
+
+        // Compute checksum: sum of all unsigned bytes, with checksum field as spaces.
+        $checksum = 0;
+        for ( $i = 0; $i < 512; $i++ ) {
+            $checksum += ord( $header[ $i ] );
+        }
+        $checksum = sprintf( '%06o', $checksum ) . "\0 ";
+        $header   = substr_replace( $header, $checksum, 148, 8 );
+
+        // Data padded to 512-byte boundary.
+        $padding = ( 512 - ( $size % 512 ) ) % 512;
+
+        return $header . $data . ( $padding > 0 ? pack( 'a' . $padding, '' ) : '' );
+    }
 
     private function is_excluded( $rel_path ) {
         foreach ( self::$excludes as $exclude ) {

@@ -72,7 +72,7 @@ class YAWP_DB_Export {
         fwrite( $fh, "LOCK TABLES `{$table}` WRITE;\n" );
 
         $offset  = 0;
-        $batch   = 1000;
+        $batch   = 100;
         $columns = null;
 
         while ( true ) {
@@ -89,7 +89,11 @@ class YAWP_DB_Export {
                 }, $fields );
             }
 
-            $values = [];
+            $insert_prefix = 'INSERT INTO `' . $table . '` (' . implode( ',', $columns ) . ') VALUES ';
+            $values        = [];
+            $stmt_size     = strlen( $insert_prefix );
+            $max_stmt_size = 1048576; // 1 MB per statement.
+
             while ( $row = mysqli_fetch_row( $result ) ) {
                 $escaped = array_map( function ( $val ) use ( $dbh ) {
                     if ( null === $val ) {
@@ -97,11 +101,23 @@ class YAWP_DB_Export {
                     }
                     return "'" . mysqli_real_escape_string( $dbh, $val ) . "'";
                 }, $row );
-                $values[] = '(' . implode( ',', $escaped ) . ')';
+                $row_str   = '(' . implode( ',', $escaped ) . ')';
+                $row_size  = strlen( $row_str ) + 2; // comma + newline.
+
+                // Flush if adding this row would exceed the limit.
+                if ( ! empty( $values ) && ( $stmt_size + $row_size ) > $max_stmt_size ) {
+                    fwrite( $fh, $insert_prefix . "\n" . implode( ",\n", $values ) . ";\n" );
+                    $values    = [];
+                    $stmt_size = strlen( $insert_prefix );
+                }
+
+                $values[]   = $row_str;
+                $stmt_size += $row_size;
             }
 
-            fwrite( $fh, 'INSERT INTO `' . $table . '` (' . implode( ',', $columns ) . ') VALUES ' . "\n" );
-            fwrite( $fh, implode( ",\n", $values ) . ";\n" );
+            if ( ! empty( $values ) ) {
+                fwrite( $fh, $insert_prefix . "\n" . implode( ",\n", $values ) . ";\n" );
+            }
 
             mysqli_free_result( $result );
             $offset += $batch;

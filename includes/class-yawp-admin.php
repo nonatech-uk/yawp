@@ -16,6 +16,7 @@ class YAWP_Admin {
         add_action( 'wp_ajax_yawp_clear_lock', [ $this, 'ajax_clear_lock' ] );
         add_action( 'wp_ajax_yawp_list_backups', [ $this, 'ajax_list_backups' ] );
         add_action( 'wp_ajax_yawp_restore_backup', [ $this, 'ajax_restore_backup' ] );
+        add_action( 'wp_ajax_yawp_restore_status', [ $this, 'ajax_restore_status' ] );
     }
 
     public function add_menu() {
@@ -199,7 +200,29 @@ class YAWP_Admin {
         if ( is_wp_error( $result ) ) {
             wp_send_json_error( $result->get_error_message() );
         }
-        wp_send_json_success( 'Restore completed successfully.' );
+        $msg = 'Restore completed successfully.';
+        if ( '' !== $new_url ) {
+            $msg .= ' Note: you may need to re-enter your S3 credentials (encryption keys differ between sites).';
+            $msg .= ' If this site uses Elementor, run Elementor → Tools → Replace URL (old → new domain) then Clear Files & Data to fix any remaining URLs in Elementor page data.';
+        }
+        wp_send_json_success( $msg );
+    }
+
+    public function ajax_restore_status() {
+        check_ajax_referer( 'yawp_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( 'Unauthorized.' );
+        }
+        $raw = get_option( 'yawp_restore_progress', '' );
+        if ( '' === $raw ) {
+            wp_send_json_success( [ 'running' => false ] );
+        }
+        $progress = json_decode( $raw, true );
+        if ( ! is_array( $progress ) ) {
+            wp_send_json_success( [ 'running' => false ] );
+        }
+        $progress['running'] = true;
+        wp_send_json_success( $progress );
     }
 
     private function get_s3_from_options() {
@@ -249,10 +272,10 @@ class YAWP_Admin {
                 <table class="form-table yawp-status-table">
                     <tr><th>Last backup</th><td><?php echo esc_html( $last_backup ); ?></td></tr>
                     <tr><th>Last full backup</th><td><?php echo esc_html( $last_full ); ?></td></tr>
-                    <tr><th>Login flag</th><td><?php echo $login_date ? esc_html( $login_date ) : 'Not set (no login today)'; ?></td></tr>
+                    <tr><th>Login flag</th><td><?php echo $login_date ? esc_html( $login_date ) : 'Not set (no login since last backup)'; ?></td></tr>
                     <tr><th>Next scheduled check</th><td><?php echo $next_scheduled ? esc_html( get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $next_scheduled ) ) ) : 'Not scheduled'; ?></td></tr>
                     <?php if ( $last_error ) : ?>
-                    <tr><th>Last error</th><td class="yawp-error"><?php echo esc_html( $last_error ); ?></td></tr>
+                    <tr><th>Last backup error</th><td class="yawp-error"><?php echo esc_html( $last_error ); ?></td></tr>
                     <?php endif; ?>
                 </table>
             </div>
@@ -581,7 +604,25 @@ class YAWP_Admin {
 
                 // Disable all restore buttons.
                 $restoreList.find('.yawp-restore-btn').prop('disabled', true);
-                setRestoreStatus('Restoring... this may take several minutes.', false);
+                setRestoreStatus('Restoring... starting...', false);
+
+                // Poll for restore progress.
+                var restorePoll = setInterval(function() {
+                    $.post(ajaxurl, {
+                        action: 'yawp_restore_status',
+                        nonce:  nonce
+                    }, function(resp) {
+                        if (!resp.success || !resp.data || !resp.data.running) return;
+                        var d = resp.data;
+                        if (d.step === 'files') {
+                            setRestoreStatus('Restoring files: part ' + d.current + ' / ' + d.total + ' (' + d.part + ')', false);
+                        } else if (d.step === 'database') {
+                            setRestoreStatus('Importing database...', false);
+                        } else if (d.step === 'rewrite') {
+                            setRestoreStatus('Rewriting URLs...', false);
+                        }
+                    });
+                }, 3000);
 
                 $.post(ajaxurl, {
                     action:  'yawp_restore_backup',
@@ -589,17 +630,19 @@ class YAWP_Admin {
                     s3_key:  key,
                     new_url: newUrl
                 }, function(resp) {
+                    clearInterval(restorePoll);
                     if (resp.success) {
                         var loginUrl = (newUrl || '') + '/wp-login.php';
                         if (!newUrl) loginUrl = '/wp-login.php';
-                        setRestoreStatus('Restore complete! Redirecting to login...', false);
-                        setTimeout(function() { window.location.href = loginUrl; }, 3000);
+                        setRestoreStatus(resp.data + ' Redirecting to login in 10s...', false);
+                        setTimeout(function() { window.location.href = loginUrl; }, 10000);
                     } else {
                         setRestoreStatus(resp.data, true);
                         $restoreList.find('.yawp-restore-btn').prop('disabled', false);
                     }
                 }).fail(function() {
-                    setRestoreStatus('Request failed.', true);
+                    clearInterval(restorePoll);
+                    setRestoreStatus('Request failed (connection lost - restore may still be running).', true);
                     $restoreList.find('.yawp-restore-btn').prop('disabled', false);
                 });
             });

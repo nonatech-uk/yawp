@@ -50,9 +50,9 @@ class YAWP_Restore {
             $dir = dirname( $key );
 
             $type = 'unknown';
-            if ( false !== strpos( $dir, '/full/' ) ) {
+            if ( false !== strpos( $dir, '/full/' ) || 0 === strpos( $dir, 'full/' ) || 'full' === $dir ) {
                 $type = 'full';
-            } elseif ( false !== strpos( $dir, '/incremental/' ) ) {
+            } elseif ( false !== strpos( $dir, '/incremental/' ) || 0 === strpos( $dir, 'incremental/' ) || 'incremental' === $dir ) {
                 $type = 'incremental';
             }
 
@@ -111,6 +111,7 @@ class YAWP_Restore {
         set_transient( 'yawp_restore_running', time(), 1800 );
 
         @set_time_limit( 1800 );
+        delete_option( 'yawp_restore_progress' );
 
         $tmp_dir = sys_get_temp_dir() . '/yawp-restore-' . time() . '/';
 
@@ -131,7 +132,7 @@ class YAWP_Restore {
             }
 
             $webroot      = rtrim( ABSPATH, '/' );
-            $tar_excludes = "--overwrite --exclude=wp-config.php --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
+            $tar_excludes = "--overwrite --exclude=wp-config.php --exclude=.htaccess --exclude=wp-content/plugins/yawp --exclude=wp-content/object-cache.php --exclude='.claude' --exclude='.git'";
 
             // If incremental, build the full chain (full + incrementals).
             if ( 'incremental' === ( $manifest['type'] ?? '' ) ) {
@@ -143,9 +144,24 @@ class YAWP_Restore {
                 $chain = [ $manifest ];
             }
 
+            // Count total parts across the chain for progress.
+            $total_parts = 0;
+            foreach ( $chain as $chain_manifest ) {
+                $total_parts += count( $chain_manifest['parts'] );
+            }
+            $current_part = 0;
+
             // Extract file parts from each backup in the chain.
             foreach ( $chain as $chain_manifest ) {
                 foreach ( $chain_manifest['parts'] as $part_key ) {
+                    $current_part++;
+                    update_option( 'yawp_restore_progress', wp_json_encode( [
+                        'step'    => 'files',
+                        'current' => $current_part,
+                        'total'   => $total_parts,
+                        'part'    => basename( $part_key ),
+                    ] ), false );
+
                     $part_path = $tmp_dir . 'part.tar.gz';
                     $result = $this->s3->get_object( $part_key, $part_path );
                     if ( is_wp_error( $result ) ) {
@@ -168,6 +184,12 @@ class YAWP_Restore {
             }
 
             // Download and import database (always from the selected backup).
+            update_option( 'yawp_restore_progress', wp_json_encode( [
+                'step'    => 'database',
+                'current' => $total_parts,
+                'total'   => $total_parts,
+            ] ), false );
+
             $db_path = $tmp_dir . 'database.sql';
             $result  = $this->s3->get_object( $manifest['database'], $db_path );
             if ( is_wp_error( $result ) ) {
@@ -189,6 +211,12 @@ class YAWP_Restore {
                 return $import_result;
             }
 
+            // Rewrite table prefix if source and target differ.
+            $prefix_result = $this->rewrite_table_prefix();
+            if ( is_wp_error( $prefix_result ) ) {
+                return $prefix_result;
+            }
+
             $this->fix_placeholder_hashes();
 
             foreach ( $saved_options as $name => $value ) {
@@ -196,16 +224,30 @@ class YAWP_Restore {
             }
 
             if ( '' !== $new_url ) {
+                update_option( 'yawp_restore_progress', wp_json_encode( [
+                    'step'    => 'rewrite',
+                    'current' => $total_parts,
+                    'total'   => $total_parts,
+                ] ), false );
+
                 $old_url = $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'siteurl'" );
                 if ( $old_url && $old_url !== $new_url ) {
                     $rewrite_result = $this->rewrite_urls( $old_url, $new_url );
                     if ( is_wp_error( $rewrite_result ) ) {
                         return $rewrite_result;
                     }
+
+                    // Rewrite URLs in static files (Elementor Google Fonts CSS, etc.).
+                    $this->rewrite_file_urls( $webroot, $old_url, $new_url );
                 }
             }
 
             delete_option( 'rewrite_rules' );
+
+            // Clear Elementor CSS cache (DB + files) so it regenerates from fresh DB data.
+            $this->clear_elementor_cache( $webroot );
+
+            delete_option( 'yawp_restore_progress' );
             return true;
 
         } finally {
@@ -305,6 +347,8 @@ class YAWP_Restore {
 
         $buffer = '';
         mysqli_query( $dbh, 'SET foreign_key_checks = 0' );
+        mysqli_query( $dbh, 'SET max_allowed_packet = 67108864' ); // 64 MB
+        $errors = [];
 
         while ( false !== ( $line = fgets( $fh ) ) ) {
             $trimmed = trim( $line );
@@ -313,17 +357,110 @@ class YAWP_Restore {
             }
             $buffer .= $line;
             if ( ';' === substr( $trimmed, -1 ) ) {
-                mysqli_query( $dbh, $buffer );
+                $ok = mysqli_query( $dbh, $buffer );
+                if ( ! $ok ) {
+                    $err = mysqli_error( $dbh );
+                    $snippet = substr( $buffer, 0, 120 );
+                    $errors[] = $err . ' | ' . $snippet;
+                }
                 $buffer = '';
             }
         }
 
         if ( '' !== trim( $buffer ) ) {
-            mysqli_query( $dbh, $buffer );
+            $ok = mysqli_query( $dbh, $buffer );
+            if ( ! $ok ) {
+                $errors[] = mysqli_error( $dbh );
+            }
         }
 
         mysqli_query( $dbh, 'SET foreign_key_checks = 1' );
         fclose( $fh );
+        mysqli_close( $dbh );
+
+        if ( ! empty( $errors ) ) {
+            error_log( 'YAWP restore SQL errors: ' . implode( ' || ', array_slice( $errors, 0, 10 ) ) );
+        }
+
+        return true;
+    }
+
+    // ──────────────────────────────────────────────
+    // Table prefix rewrite
+    // ──────────────────────────────────────────────
+
+    /**
+     * Detect the source table prefix from imported tables and rename
+     * to match the local $table_prefix if they differ.
+     */
+    private function rewrite_table_prefix() {
+        global $wpdb, $table_prefix;
+
+        $dbh = $this->get_raw_dbh();
+        if ( ! $dbh ) {
+            return new WP_Error( 'yawp_restore', 'Cannot connect to database for prefix rewrite.' );
+        }
+
+        // Find the source prefix by looking for a known WP table.
+        $result = mysqli_query( $dbh, 'SHOW TABLES' );
+        if ( ! $result ) {
+            mysqli_close( $dbh );
+            return true; // Nothing to do.
+        }
+
+        $source_prefix = '';
+        $all_tables    = [];
+        while ( $row = mysqli_fetch_row( $result ) ) {
+            $all_tables[] = $row[0];
+            // Detect source prefix from the options table.
+            if ( '' === $source_prefix && preg_match( '/^(.+)options$/', $row[0], $m ) ) {
+                $source_prefix = $m[1];
+            }
+        }
+
+        if ( '' === $source_prefix || $source_prefix === $table_prefix ) {
+            mysqli_close( $dbh );
+            return true; // Prefixes match, nothing to do.
+        }
+
+        error_log( "YAWP restore: rewriting table prefix from '{$source_prefix}' to '{$table_prefix}'" );
+
+        // Rename all tables with the source prefix.
+        $sp_len = strlen( $source_prefix );
+        foreach ( $all_tables as $tbl ) {
+            if ( 0 === strpos( $tbl, $source_prefix ) ) {
+                $new_name = $table_prefix . substr( $tbl, $sp_len );
+                if ( $tbl !== $new_name ) {
+                    mysqli_query( $dbh, "DROP TABLE IF EXISTS `{$new_name}`" );
+                    mysqli_query( $dbh, "RENAME TABLE `{$tbl}` TO `{$new_name}`" );
+                }
+            }
+        }
+
+        // Update option_name entries that embed the prefix (e.g. {prefix}user_roles).
+        $options_table = $table_prefix . 'options';
+        $sp_esc = mysqli_real_escape_string( $dbh, $source_prefix );
+        $tp_esc = mysqli_real_escape_string( $dbh, $table_prefix );
+        mysqli_query( $dbh,
+            "UPDATE `{$options_table}` SET `option_name` = CONCAT('{$tp_esc}', SUBSTRING(`option_name`, " . ( $sp_len + 1 ) . ")) WHERE `option_name` LIKE '{$sp_esc}%' AND `option_name` NOT LIKE '{$tp_esc}%'"
+        );
+
+        // Update usermeta meta_key entries that embed the prefix (e.g. {prefix}capabilities).
+        $usermeta_table = $table_prefix . 'usermeta';
+        mysqli_query( $dbh,
+            "UPDATE `{$usermeta_table}` SET `meta_key` = CONCAT('{$tp_esc}', SUBSTRING(`meta_key`, " . ( $sp_len + 1 ) . ")) WHERE `meta_key` LIKE '{$sp_esc}%' AND `meta_key` NOT LIKE '{$tp_esc}%'"
+        );
+
+        // Drop leftover source-prefixed tables (in case rename left duplicates).
+        $result2 = mysqli_query( $dbh, 'SHOW TABLES' );
+        if ( $result2 ) {
+            while ( $row = mysqli_fetch_row( $result2 ) ) {
+                if ( 0 === strpos( $row[0], $source_prefix ) && 0 !== strpos( $row[0], $table_prefix ) ) {
+                    mysqli_query( $dbh, "DROP TABLE IF EXISTS `{$row[0]}`" );
+                }
+            }
+        }
+
         mysqli_close( $dbh );
         return true;
     }
@@ -366,9 +503,13 @@ class YAWP_Restore {
         foreach ( $tables as $table ) {
             $columns = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
             $text_cols = [];
+            $pk_cols   = [];
             foreach ( $columns as $col ) {
                 if ( preg_match( '/varchar|text|longtext|mediumtext/i', $col['Type'] ) ) {
                     $text_cols[] = $col['Field'];
+                }
+                if ( 'PRI' === $col['Key'] ) {
+                    $pk_cols[] = $col['Field'];
                 }
             }
 
@@ -376,20 +517,188 @@ class YAWP_Restore {
                 continue;
             }
 
+            // Build WHERE clause to find rows containing old URLs.
             foreach ( $pairs as $pair ) {
                 $old_esc = mysqli_real_escape_string( $dbh, $pair[0] );
-                $new_esc = mysqli_real_escape_string( $dbh, $pair[1] );
 
                 foreach ( $text_cols as $col ) {
-                    mysqli_query( $dbh,
-                        "UPDATE `{$table}` SET `{$col}` = REPLACE(`{$col}`, '{$old_esc}', '{$new_esc}') WHERE `{$col}` LIKE '%{$old_esc}%'"
+                    // Check if any rows contain the old URL in this column.
+                    $check = mysqli_query( $dbh,
+                        "SELECT COUNT(*) FROM `{$table}` WHERE `{$col}` LIKE '%{$old_esc}%' LIMIT 1"
                     );
+                    if ( ! $check ) {
+                        continue;
+                    }
+                    $count_row = mysqli_fetch_row( $check );
+                    if ( ! $count_row || 0 === (int) $count_row[0] ) {
+                        continue;
+                    }
+
+                    // If no primary key, fall back to simple SQL REPLACE.
+                    if ( empty( $pk_cols ) ) {
+                        $new_esc = mysqli_real_escape_string( $dbh, $pair[1] );
+                        mysqli_query( $dbh,
+                            "UPDATE `{$table}` SET `{$col}` = REPLACE(`{$col}`, '{$old_esc}', '{$new_esc}') WHERE `{$col}` LIKE '%{$old_esc}%'"
+                        );
+                        continue;
+                    }
+
+                    // Fetch rows with old URL and do serialization-aware replacement.
+                    $pk_select = implode( ',', array_map( function( $c ) { return "`{$c}`"; }, $pk_cols ) );
+                    $result = mysqli_query( $dbh,
+                        "SELECT {$pk_select}, `{$col}` FROM `{$table}` WHERE `{$col}` LIKE '%{$old_esc}%'"
+                    );
+                    if ( ! $result ) {
+                        continue;
+                    }
+
+                    while ( $row = mysqli_fetch_assoc( $result ) ) {
+                        $value     = $row[ $col ];
+                        $new_value = $this->serialized_replace( $pair[0], $pair[1], $value );
+
+                        if ( $new_value === $value ) {
+                            continue;
+                        }
+
+                        $new_esc = mysqli_real_escape_string( $dbh, $new_value );
+                        $where_parts = [];
+                        foreach ( $pk_cols as $pk ) {
+                            $where_parts[] = "`{$pk}` = '" . mysqli_real_escape_string( $dbh, $row[ $pk ] ) . "'";
+                        }
+                        mysqli_query( $dbh,
+                            "UPDATE `{$table}` SET `{$col}` = '{$new_esc}' WHERE " . implode( ' AND ', $where_parts ) . " LIMIT 1"
+                        );
+                    }
+                    mysqli_free_result( $result );
                 }
             }
         }
 
         mysqli_close( $dbh );
         return true;
+    }
+
+    /**
+     * Search-and-replace that handles PHP serialized data.
+     *
+     * If the value is serialized, recursively walk the data structure,
+     * replace strings, and re-serialize (fixing string length prefixes).
+     * If not serialized, do a plain str_replace.
+     */
+    private function serialized_replace( $search, $replace, $value ) {
+        // Try to unserialize.
+        $unserialized = @unserialize( $value );
+        if ( false !== $unserialized || 'b:0;' === $value ) {
+            $replaced = $this->walk_replace( $search, $replace, $unserialized );
+            return serialize( $replaced );
+        }
+
+        // Try JSON (Elementor uses JSON in postmeta too).
+        $decoded = json_decode( $value, true );
+        if ( null !== $decoded && ( is_array( $decoded ) || is_object( $decoded ) ) ) {
+            $replaced = $this->walk_replace( $search, $replace, $decoded );
+            return wp_json_encode( $replaced, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+        }
+
+        // Plain string.
+        return str_replace( $search, $replace, $value );
+    }
+
+    /**
+     * Recursively walk a data structure and replace strings.
+     */
+    private function walk_replace( $search, $replace, $data ) {
+        if ( is_string( $data ) ) {
+            return str_replace( $search, $replace, $data );
+        }
+        if ( is_array( $data ) ) {
+            $result = [];
+            foreach ( $data as $key => $val ) {
+                $new_key = is_string( $key ) ? str_replace( $search, $replace, $key ) : $key;
+                $result[ $new_key ] = $this->walk_replace( $search, $replace, $val );
+            }
+            return $result;
+        }
+        if ( is_object( $data ) ) {
+            foreach ( get_object_vars( $data ) as $prop => $val ) {
+                $data->$prop = $this->walk_replace( $search, $replace, $val );
+            }
+            return $data;
+        }
+        return $data;
+    }
+
+    /**
+     * Clear Elementor's CSS cache — both DB postmeta and generated files.
+     * Forces Elementor to regenerate CSS from the actual DB settings on next load.
+     */
+    private function clear_elementor_cache( $webroot ) {
+        // Delete _elementor_css postmeta entries (DB-level cache).
+        $dbh = $this->get_raw_dbh();
+        if ( $dbh ) {
+            global $table_prefix;
+            $pm = $table_prefix . 'postmeta';
+            mysqli_query( $dbh, "DELETE FROM `{$pm}` WHERE `meta_key` = '_elementor_css'" );
+            // Also clear Elementor's file generation flags.
+            $opts = $table_prefix . 'options';
+            mysqli_query( $dbh, "DELETE FROM `{$opts}` WHERE `option_name` LIKE '_elementor_global_css%'" );
+            mysqli_query( $dbh, "DELETE FROM `{$opts}` WHERE `option_name` LIKE 'elementor_css_print_method%'" );
+            mysqli_close( $dbh );
+        }
+
+        // Delete generated CSS files on disk.
+        $css_dir = $webroot . '/wp-content/uploads/elementor/css';
+        if ( is_dir( $css_dir ) ) {
+            $files = glob( $css_dir . '/*.css' );
+            if ( $files ) {
+                foreach ( $files as $file ) {
+                    @unlink( $file );
+                }
+            }
+        }
+    }
+
+    /**
+     * Rewrite URLs in static files on disk (e.g. Elementor Google Fonts CSS).
+     *
+     * These files contain hardcoded absolute URLs that the DB rewrite doesn't touch.
+     */
+    private function rewrite_file_urls( $webroot, $old_url, $new_url ) {
+        $old_url = rtrim( $old_url, '/' );
+        $new_url = rtrim( $new_url, '/' );
+
+        // Directories containing files that may embed absolute URLs.
+        $scan_dirs = [
+            $webroot . '/wp-content/uploads/elementor/google-fonts/css',
+            $webroot . '/wp-content/uploads/elementor/css',
+        ];
+
+        foreach ( $scan_dirs as $dir ) {
+            if ( ! is_dir( $dir ) ) {
+                continue;
+            }
+            $files = glob( $dir . '/*.css' );
+            if ( ! $files ) {
+                continue;
+            }
+            foreach ( $files as $file ) {
+                $content = file_get_contents( $file );
+                if ( false === $content || false === strpos( $content, $old_url ) ) {
+                    continue;
+                }
+                $new_content = str_replace( $old_url, $new_url, $content );
+                file_put_contents( $file, $new_content );
+            }
+        }
+
+        // Also rewrite Elementor's custom-frontend CSS if present.
+        $custom_css = $webroot . '/wp-content/uploads/elementor/custom-frontend.min.css';
+        if ( file_exists( $custom_css ) ) {
+            $content = file_get_contents( $custom_css );
+            if ( false !== $content && false !== strpos( $content, $old_url ) ) {
+                file_put_contents( $custom_css, str_replace( $old_url, $new_url, $content ) );
+            }
+        }
     }
 
     private function fix_placeholder_hashes() {
