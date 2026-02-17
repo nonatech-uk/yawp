@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
  * State machine: init → archive (×N) → finish
  *
  * Backup format in S3:
- *   {prefix}/{type}/{timestamp}/database.sql
+ *   {prefix}/{type}/{timestamp}/database.sql.gz
  *   {prefix}/{type}/{timestamp}/part-0001.tar.gz
  *   {prefix}/{type}/{timestamp}/part-0002.tar.gz
  *   ...
@@ -241,19 +241,45 @@ class YAWP_Backup {
             return $this->fail_state( $state, $result->get_error_message() );
         }
 
-        $db_size = filesize( $db_tmp );
-        $state = $this->log_state( $state, 'Database exported (' . size_format( $db_size ) . ').' );
+        $db_size_raw = filesize( $db_tmp );
+        $state = $this->log_state( $state, 'Database exported (' . size_format( $db_size_raw ) . ').' );
+
+        // Gzip the SQL dump before uploading.
+        $gz_tmp = $db_tmp . '.gz';
+        $gz_ok  = false;
+        $in     = fopen( $db_tmp, 'rb' );
+        $out    = gzopen( $gz_tmp, 'wb6' );
+        if ( $in && $out ) {
+            while ( ! feof( $in ) ) {
+                gzwrite( $out, fread( $in, 131072 ) );
+            }
+            gzclose( $out );
+            fclose( $in );
+            $gz_ok = true;
+        } else {
+            if ( $in )  fclose( $in );
+            if ( $out ) gzclose( $out );
+        }
+        @unlink( $db_tmp );
+
+        if ( ! $gz_ok ) {
+            @unlink( $gz_tmp );
+            return $this->fail_state( $state, 'Failed to gzip database dump.' );
+        }
+
+        $db_size = filesize( $gz_tmp );
+        $state = $this->log_state( $state, 'Database compressed (' . size_format( $db_size ) . ').' );
 
         // Upload database dump to S3.
         $s3 = $this->get_s3();
         if ( is_wp_error( $s3 ) ) {
-            @unlink( $db_tmp );
+            @unlink( $gz_tmp );
             return $this->fail_state( $state, $s3->get_error_message() );
         }
 
-        $db_key = $state['s3_dir'] . '/database.sql';
-        $upload = $s3->stream_upload( $db_key, $db_tmp, self::RETENTION_DAYS );
-        @unlink( $db_tmp );
+        $db_key = $state['s3_dir'] . '/database.sql.gz';
+        $upload = $s3->stream_upload( $db_key, $gz_tmp, self::RETENTION_DAYS );
+        @unlink( $gz_tmp );
         if ( is_wp_error( $upload ) ) {
             return $this->fail_state( $state, 'DB upload failed: ' . $upload->get_error_message() );
         }
@@ -722,7 +748,7 @@ Created:     {$date}
 
 Structure (v2 — chunked)
 ------------------------
-{$pfx}/{type}/{timestamp}/database.sql          Full database dump
+{$pfx}/{type}/{timestamp}/database.sql.gz       Gzipped database dump
 {$pfx}/{type}/{timestamp}/part-0001.tar.gz      File archive part 1
 {$pfx}/{type}/{timestamp}/part-0002.tar.gz      File archive part 2
   ...

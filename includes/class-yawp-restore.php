@@ -190,10 +190,31 @@ class YAWP_Restore {
                 'total'   => $total_parts,
             ] ), false );
 
-            $db_path = $tmp_dir . 'database.sql';
-            $result  = $this->s3->get_object( $manifest['database'], $db_path );
+            $db_s3_key  = $manifest['database'];
+            $is_gz      = ( '.gz' === substr( $db_s3_key, -3 ) );
+            $db_dl_path = $tmp_dir . ( $is_gz ? 'database.sql.gz' : 'database.sql' );
+            $db_path    = $tmp_dir . 'database.sql';
+
+            $result = $this->s3->get_object( $db_s3_key, $db_dl_path );
             if ( is_wp_error( $result ) ) {
                 return $result;
+            }
+
+            // Decompress if gzipped.
+            if ( $is_gz ) {
+                $gz_in  = gzopen( $db_dl_path, 'rb' );
+                $sql_out = fopen( $db_path, 'wb' );
+                if ( ! $gz_in || ! $sql_out ) {
+                    if ( $gz_in )   gzclose( $gz_in );
+                    if ( $sql_out ) fclose( $sql_out );
+                    return new WP_Error( 'yawp_restore', 'Failed to decompress database dump.' );
+                }
+                while ( ! gzeof( $gz_in ) ) {
+                    fwrite( $sql_out, gzread( $gz_in, 131072 ) );
+                }
+                gzclose( $gz_in );
+                fclose( $sql_out );
+                @unlink( $db_dl_path );
             }
 
             // Save YAWP settings.
