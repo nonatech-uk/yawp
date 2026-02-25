@@ -201,6 +201,9 @@ class YAWP_Backup {
                 case 'init':
                     $state = $this->step_init( $state );
                     break;
+                case 'scan':
+                    $state = $this->step_scan( $state );
+                    break;
                 case 'archive':
                     $state = $this->step_archive( $state );
                     break;
@@ -285,12 +288,27 @@ class YAWP_Backup {
         }
         $state = $this->log_state( $state, 'Database uploaded to S3.' );
 
-        // Build file list.
-        $state = $this->log_state( $state, 'Building file list.' );
+        // Store webroot and DB size for subsequent steps.
         $webroot = rtrim( $this->get_webroot(), '/' );
         if ( ! is_dir( $webroot ) ) {
             return $this->fail_state( $state, 'Webroot does not exist: ' . $webroot );
         }
+
+        $state['webroot']    = $webroot;
+        $state['total_size'] = $db_size;
+        $state['step']       = 'scan';
+
+        return $state;
+    }
+
+    /**
+     * Scan the webroot and stream the file list directly to wp_options
+     * in BATCH_SIZE chunks.  This avoids accumulating 50k+ paths in a
+     * single PHP array — critical on memory-constrained shared hosting.
+     */
+    private function step_scan( $state ) {
+        $state = $this->log_state( $state, 'Building file list.' );
+        $webroot = $state['webroot'];
 
         $since = 0;
         if ( 'incremental' === $state['type'] ) {
@@ -300,7 +318,6 @@ class YAWP_Backup {
             }
         }
 
-        $file_list = [];
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator(
                 $webroot,
@@ -308,6 +325,12 @@ class YAWP_Backup {
             ),
             RecursiveIteratorIterator::SELF_FIRST
         );
+
+        // Stream file paths directly to wp_options in BATCH_SIZE chunks
+        // instead of accumulating the entire list in memory first.
+        $batch       = [];
+        $chunk_index = 0;
+        $count       = 0;
 
         foreach ( $iterator as $file ) {
             $real_path = $file->getRealPath();
@@ -340,27 +363,27 @@ class YAWP_Backup {
                 continue;
             }
 
-            $file_list[] = $rel_path;
+            $batch[] = $rel_path;
+            $count++;
+
+            if ( count( $batch ) >= self::BATCH_SIZE ) {
+                update_option( self::FILE_LIST_KEY . '_' . $chunk_index, wp_json_encode( $batch ), false );
+                $chunk_index++;
+                $batch = [];
+            }
         }
 
-        $count = count( $file_list );
+        // Save any remaining files in the last partial batch.
+        if ( ! empty( $batch ) ) {
+            update_option( self::FILE_LIST_KEY . '_' . $chunk_index, wp_json_encode( $batch ), false );
+            $chunk_index++;
+        }
+        update_option( self::FILE_LIST_KEY . '_chunks', $chunk_index, false );
+
         $state = $this->log_state( $state, "Found {$count} files to archive." );
-
-        // Store file list in per-batch chunks in wp_options.
-        // One giant 53k-entry JSON blob exceeds MySQL limits on shared hosting,
-        // and decoding it every 5-second poll is too slow. Each chunk holds one
-        // batch worth of files so the archive step only reads what it needs.
-        $chunks     = array_chunk( $file_list, self::BATCH_SIZE );
-        $num_chunks = count( $chunks );
-        for ( $i = 0; $i < $num_chunks; $i++ ) {
-            update_option( self::FILE_LIST_KEY . '_' . $i, wp_json_encode( $chunks[ $i ] ), false );
-        }
-        update_option( self::FILE_LIST_KEY . '_chunks', $num_chunks, false );
 
         $state['file_cursor'] = 0;
         $state['file_count']  = $count;
-        $state['webroot']     = $webroot;
-        $state['total_size']  = $db_size;
         $state['step']        = 'archive';
 
         return $state;

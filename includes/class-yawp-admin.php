@@ -133,6 +133,25 @@ class YAWP_Admin {
         if ( ! current_user_can( 'manage_options' ) ) {
             wp_send_json_error( 'Unauthorized.' );
         }
+
+        // Reserve memory so the shutdown handler can still send a JSON
+        // response if PHP hits the memory limit during a backup step.
+        $reserved = str_repeat( "\0", 65536 );
+
+        register_shutdown_function( function () use ( &$reserved ) {
+            $error = error_get_last();
+            if ( $error && in_array( $error['type'], [ E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
+                $reserved = null; // Free the 64 KB reserve.
+                if ( ! headers_sent() ) {
+                    header( 'Content-Type: application/json; charset=UTF-8' );
+                }
+                $msg = 'PHP fatal during backup step: ' . $error['message'];
+                // Record the error so the history table shows what happened.
+                update_option( 'yawp_last_error', $msg, false );
+                echo wp_json_encode( [ 'success' => false, 'data' => $msg ] );
+            }
+        } );
+
         $status = YAWP_Backup::get_status();
         // Directly run the next step if the backup is still in progress.
         // This makes the browser's 5-second poll the primary driver instead
@@ -421,7 +440,8 @@ class YAWP_Admin {
 
             function stepLabel(step, progress) {
                 switch (step) {
-                    case 'init':     return 'Exporting database & building file list\u2026';
+                    case 'init':     return 'Exporting database\u2026';
+                    case 'scan':     return 'Scanning files\u2026';
                     case 'archive':  return 'Archiving files (' + (progress || '') + ')\u2026';
                     case 'compress': return 'Compressing archive\u2026';
                     case 'upload':   return 'Uploading to S3\u2026';
@@ -434,7 +454,7 @@ class YAWP_Admin {
                 $.post(ajaxurl, { action: 'yawp_backup_status', nonce: nonce }, function(resp) {
                     if (!resp.success) {
                         stopPoll();
-                        setStatus('Status check failed.', true);
+                        setStatus(resp.data || 'Status check failed.', true);
                         enableBackupButtons();
                         return;
                     }
