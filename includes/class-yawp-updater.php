@@ -131,6 +131,9 @@ class YAWP_Updater {
         ]);
 
         if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+            yawp_log( 'warning', 'GitHub release check failed', [
+                'http_code' => is_wp_error( $response ) ? 0 : wp_remote_retrieve_response_code( $response ),
+            ]);
             return false;
         }
 

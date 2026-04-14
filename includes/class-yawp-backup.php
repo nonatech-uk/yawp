@@ -146,6 +146,7 @@ class YAWP_Backup {
         set_transient( self::LOCK_KEY, time(), self::LOCK_TTL );
 
         $this->healthcheck( 'start' );
+        yawp_log( 'info', 'Backup started', [ 'type' => $type ] );
 
         $timestamp = gmdate( 'Y-m-d_His' );
         $prefix    = trim( get_option( 'yawp_s3_prefix', '' ), '/' );
@@ -556,6 +557,7 @@ class YAWP_Backup {
         self::delete_file_list_chunks();
 
         $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully (' . $state['part_num'] . ' parts, ' . size_format( $state['total_size'] ) . ').' );
+        yawp_log( 'info', 'Backup completed', [ 'type' => $state['type'], 'parts' => $state['part_num'], 'size' => $state['total_size'] ] );
         $this->healthcheck( 'success', $state['log'] );
 
         delete_transient( self::LOCK_KEY );
@@ -592,6 +594,7 @@ class YAWP_Backup {
     }
 
     private function fail_state( $state, $message ) {
+        yawp_log( 'error', 'Backup failed: ' . $message, [ 'type' => $state['type'], 'step' => $state['step'] ?? 'unknown' ] );
         $state = $this->log_state( $state, 'FAILED: ' . $message );
         $state['step']  = 'error';
         $state['error'] = $message;

@@ -61,6 +61,7 @@ class YAWP_Scheduler {
             $key       = ( $prefix ? $prefix . '/' : '' ) . 'incremental/' . $timestamp . '.skipped';
             $s3->put_text( $key, 'No login detected. Backup skipped at ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC.' );
         }
+        yawp_log( 'info', 'Daily backup check: skipped (no login)' );
         $backup->healthcheck( 'success', 'No login detected — backup skipped.' );
     }
 }

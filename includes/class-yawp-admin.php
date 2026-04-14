@@ -217,8 +217,10 @@ class YAWP_Admin {
         $restore = new YAWP_Restore( $s3 );
         $result  = $restore->restore( $s3_key, $new_url );
         if ( is_wp_error( $result ) ) {
+            yawp_log( 'error', 'Restore failed: ' . $result->get_error_message(), [ 's3_key' => $s3_key ] );
             wp_send_json_error( $result->get_error_message() );
         }
+        yawp_log( 'info', 'Restore completed', [ 's3_key' => $s3_key, 'url_rewrite' => $new_url ?: 'none' ] );
         $msg = 'Restore completed successfully.';
         if ( '' !== $new_url ) {
             $msg .= ' Note: you may need to re-enter your S3 credentials (encryption keys differ between sites).';

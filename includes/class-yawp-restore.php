@@ -400,7 +400,7 @@ class YAWP_Restore {
         mysqli_close( $dbh );
 
         if ( ! empty( $errors ) ) {
-            error_log( 'YAWP restore SQL errors: ' . implode( ' || ', array_slice( $errors, 0, 10 ) ) );
+            yawp_log( 'warning', 'Restore SQL errors', [ 'count' => count( $errors ), 'sample' => $errors[0] ?? '' ] );
         }
 
         return true;
@@ -444,7 +444,7 @@ class YAWP_Restore {
             return true; // Prefixes match, nothing to do.
         }
 
-        error_log( "YAWP restore: rewriting table prefix from '{$source_prefix}' to '{$table_prefix}'" );
+        yawp_log( 'info', 'Rewriting table prefix', [ 'from' => $source_prefix, 'to' => $table_prefix ] );
 
         // Rename all tables with the source prefix.
         $sp_len = strlen( $source_prefix );
