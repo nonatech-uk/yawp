@@ -46,6 +46,7 @@ class YAWP_Admin {
             'yawp_webroot'              => 'sanitize_text_field',
             'yawp_full_backup_interval' => 'absint',
             'yawp_healthchecks_url'     => 'esc_url_raw',
+            'yawp_extra_excludes'       => [ $this, 'sanitize_excludes' ],
         ];
         foreach ( $fields as $name => $sanitize ) {
             register_setting( 'yawp_settings', $name, [ 'sanitize_callback' => $sanitize ] );
@@ -57,6 +58,39 @@ class YAWP_Admin {
             return get_option( 'yawp_s3_secret_key' );
         }
         return self::encrypt_secret( $value );
+    }
+
+    /**
+     * Sanitise the user-supplied extra-excludes list.
+     *
+     * Accepts a comma-separated string of paths relative to the webroot.
+     * Trims whitespace, strips leading/trailing slashes, drops entries
+     * that contain '..' (blocks directory-traversal shenanigans), and
+     * returns a canonical comma-joined string for storage.
+     */
+    public function sanitize_excludes( $value ) {
+        if ( ! is_string( $value ) ) {
+            return '';
+        }
+        $out = [];
+        // Accept commas, newlines, or carriage returns as separators —
+        // textareas naturally produce newlines, but legacy comma input
+        // must keep working.
+        foreach ( preg_split( '/[,\r\n]+/', $value ) as $item ) {
+            $item = trim( $item );
+            $item = trim( $item, "/\\" );
+            if ( '' === $item ) {
+                continue;
+            }
+            if ( false !== strpos( $item, '..' ) ) {
+                continue;
+            }
+            $item = sanitize_text_field( $item );
+            if ( '' !== $item ) {
+                $out[] = $item;
+            }
+        }
+        return implode( ',', $out );
     }
 
     // ──────────────────────────────────────────────
@@ -134,19 +168,16 @@ class YAWP_Admin {
             wp_send_json_error( 'Unauthorized.' );
         }
 
-        // Reserve memory so the shutdown handler can still send a JSON
-        // response if PHP hits the memory limit during a backup step.
-        $reserved = str_repeat( "\0", 65536 );
-
-        register_shutdown_function( function () use ( &$reserved ) {
+        // Record any fatal so the history table explains the failure.
+        // Memory stays bounded in the disk-staged archive pipeline, so
+        // no emergency reserve is needed.
+        register_shutdown_function( function () {
             $error = error_get_last();
             if ( $error && in_array( $error['type'], [ E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR ], true ) ) {
-                $reserved = null; // Free the 64 KB reserve.
                 if ( ! headers_sent() ) {
                     header( 'Content-Type: application/json; charset=UTF-8' );
                 }
                 $msg = 'PHP fatal during backup step: ' . $error['message'];
-                // Record the error so the history table shows what happened.
                 update_option( 'yawp_last_error', $msg, false );
                 echo wp_json_encode( [ 'success' => false, 'data' => $msg ] );
             }
@@ -356,6 +387,13 @@ class YAWP_Admin {
                         <td><input type="url" id="yawp_healthchecks_url" name="yawp_healthchecks_url"
                             value="<?php echo esc_attr( get_option( 'yawp_healthchecks_url', '' ) ); ?>" class="regular-text" />
                             <p class="description">Optional. Full URL to ping on backup start/finish. Leave blank to disable.</p></td>
+                    </tr>
+                    <tr>
+                        <th><label for="yawp_extra_excludes">Extra excludes</label></th>
+                        <td><textarea id="yawp_extra_excludes" name="yawp_extra_excludes"
+                            class="large-text code" rows="4"
+                            placeholder="wp-content/uploads/huge-videos&#10;wp-content/ai1wm-backups"><?php echo esc_textarea( get_option( 'yawp_extra_excludes', '' ) ); ?></textarea>
+                            <p class="description">Optional. One path per line (or comma-separated), relative to the WordPress root, in addition to the built-in defaults (caches, <code>.git</code>, the plugin itself, etc.). Matches a directory and everything inside it.</p></td>
                     </tr>
                 </table>
                 <?php submit_button( 'Save Settings' ); ?>

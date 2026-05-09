@@ -5,35 +5,39 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 /**
- * Chunked backup engine — no temp files persist between requests.
+ * Chunked backup engine — disk-staged, streaming, resumable.
  *
- * IONOS shared hosting aggressively cleans up temp directories between
- * PHP requests, so we cannot accumulate a tar archive across steps.
- * Instead, each step creates a small tar.gz from a batch of files,
- * uploads it directly to S3, then deletes the local copy.
+ * Each archive step streams one batch of files into an independent gzip
+ * member written under wp-content/yawp-tmp/<timestamp>/current/. Once the
+ * cumulative size of staged fragments reaches TARGET_PART_SIZE, a close_part
+ * step concatenates them (concatenated gzip members form a valid gzip file
+ * per RFC 1952 §2.2), appends the tar EOF marker as a final member, uploads
+ * the combined part via multipart streaming S3, and deletes the local copy.
  *
- * State machine: init → archive (×N) → finish
+ * Memory stays flat at a few MB regardless of site size because tar entries
+ * are streamed directly into a gzopen'd file handle — never concatenated in
+ * memory, never gzencode'd as a single blob.
  *
- * Backup format in S3:
+ * State machine: init → scan → archive ⇄ close_part → finish
+ *
+ * Backup format in S3 (unchanged from v2):
  *   {prefix}/{type}/{timestamp}/database.sql.gz
  *   {prefix}/{type}/{timestamp}/part-0001.tar.gz
  *   {prefix}/{type}/{timestamp}/part-0002.tar.gz
  *   ...
  *   {prefix}/{type}/{timestamp}/manifest.json
- *
- * Also writes a single combined .tar.gz key to manifest for backward-
- * compatible listing by the restore class.
  */
 class YAWP_Backup {
 
-    const LOCK_KEY       = 'yawp_backup_running';
-    const LOCK_TTL       = 7200; // 2 hours (large sites take time)
-    const STATE_KEY      = 'yawp_backup_state';
-    const FILE_LIST_KEY  = 'yawp_backup_filelist';
-    const CRON_HOOK      = 'yawp_backup_step';
-    const RETENTION_DAYS = 0;
-    const BATCH_SIZE     = 200; // files per archive step
-    const MAX_FILE_SIZE  = 52428800; // 50 MB — skip larger files to avoid PharData truncation
+    const LOCK_KEY         = 'yawp_backup_running';
+    const LOCK_TTL         = 7200; // 2 hours (large sites take time)
+    const STATE_KEY        = 'yawp_backup_state';
+    const FILE_LIST_KEY    = 'yawp_backup_filelist';
+    const CRON_HOOK        = 'yawp_backup_step';
+    const RETENTION_DAYS   = 0;
+    const BATCH_SIZE       = 250;       // files per archive step — bounds worst-case part-size overshoot to ~one batch
+    const TARGET_PART_SIZE = 268435456; // 256 MB — close and upload a part when staged fragments exceed this
+    const FREAD_CHUNK      = 65536;     // 64 KB per fread when streaming a file into gzip
 
     /**
      * Directories/files to exclude from backups (relative to webroot).
@@ -47,6 +51,13 @@ class YAWP_Backup {
         '.claude',
         '.opcache',
     ];
+
+    /**
+     * Memoised merge of the built-in excludes and the user's
+     * comma-separated list from the yawp_extra_excludes setting.
+     * Parsed once per PHP request (each cron step is a fresh request).
+     */
+    private static $combined_excludes = null;
 
     // ──────────────────────────────────────────────
     // Public API
@@ -92,11 +103,14 @@ class YAWP_Backup {
             'type'    => $state['type'] ?? '',
         ];
 
-        // Progress info for archive step.
-        if ( 'archive' === $status['step'] ) {
+        // Progress info for archive / close_part steps.
+        if ( 'archive' === $status['step'] || 'close_part' === $status['step'] ) {
             $total   = $state['file_count'] ?? 0;
             $cursor  = $state['file_cursor'] ?? 0;
             $status['progress'] = $cursor . '/' . $total . ' files';
+            if ( 'close_part' === $status['step'] ) {
+                $status['progress'] .= ' — uploading part ' . ( ( $state['part_num'] ?? 0 ) + 1 );
+            }
         }
 
         if ( 'error' === $status['step'] ) {
@@ -116,6 +130,14 @@ class YAWP_Backup {
      * Cancel a running backup and clean up.
      */
     public static function cancel() {
+        // Read state before clearing it so we know which staging dir to nuke.
+        $raw = get_option( self::STATE_KEY, '' );
+        if ( ! empty( $raw ) ) {
+            $state = json_decode( $raw, true );
+            if ( is_array( $state ) && ! empty( $state['staging_dir'] ) ) {
+                self::rrmdir( $state['staging_dir'] );
+            }
+        }
         delete_option( self::STATE_KEY );
         self::delete_file_list_chunks();
         delete_transient( self::LOCK_KEY );
@@ -145,6 +167,9 @@ class YAWP_Backup {
         }
         set_transient( self::LOCK_KEY, time(), self::LOCK_TTL );
 
+        // Pick up after any prior backup that crashed without cleanup.
+        self::sweep_orphan_staging();
+
         $this->healthcheck( 'start' );
         yawp_log( 'info', 'Backup started', [ 'type' => $type ] );
 
@@ -153,15 +178,19 @@ class YAWP_Backup {
         $s3_dir    = ( $prefix ? $prefix . '/' : '' ) . $type . '/' . $timestamp;
 
         $state = [
-            'step'        => 'init',
-            'type'        => $type,
-            'timestamp'   => $timestamp,
-            's3_dir'      => $s3_dir,
-            'file_cursor' => 0,
-            'file_count'  => 0,
-            'part_num'    => 0,
-            'total_size'  => 0,
-            'log'         => '',
+            'step'              => 'init',
+            'type'              => $type,
+            'timestamp'         => $timestamp,
+            's3_dir'            => $s3_dir,
+            'staging_dir'       => '',
+            'file_cursor'       => 0,
+            'file_count'        => 0,
+            'part_num'          => 0,
+            'batch_seq'         => 0,
+            'current_part_size' => 0,
+            'total_size'        => 0,
+            'skipped_count'     => 0,
+            'log'               => '',
         ];
 
         $this->save_state( $state );
@@ -208,6 +237,9 @@ class YAWP_Backup {
                 case 'archive':
                     $state = $this->step_archive( $state );
                     break;
+                case 'close_part':
+                    $state = $this->step_close_part( $state );
+                    break;
                 case 'finish':
                     $state = $this->step_finish( $state );
                     break;
@@ -234,6 +266,28 @@ class YAWP_Backup {
 
     private function step_init( $state ) {
         $state = $this->log_state( $state, 'Starting ' . $state['type'] . ' backup.' );
+
+        // Create the staging directory under wp-content/yawp-tmp/.
+        $staging = self::create_staging_dir( $state['timestamp'] );
+        if ( is_wp_error( $staging ) ) {
+            return $this->fail_state( $state, $staging->get_error_message() );
+        }
+        $state['staging_dir'] = $staging;
+
+        // Preflight: need headroom for the active part's fragments plus
+        // its concatenated copy (uploaded then deleted). The threshold is
+        // checked between batches, so a fat batch can overshoot
+        // TARGET_PART_SIZE — reserve 3× to absorb that overshoot safely.
+        $need = 3 * self::TARGET_PART_SIZE;
+        $free = @disk_free_space( WP_CONTENT_DIR );
+        if ( false !== $free && $free < $need ) {
+            return $this->fail_state( $state, sprintf(
+                'Not enough free disk space under wp-content (%s free, %s required).',
+                size_format( (int) $free ),
+                size_format( $need )
+            ) );
+        }
+        $state = $this->log_state( $state, 'Staging dir ready (' . $staging . ').' );
 
         // Export database to a temp file, upload to S3, delete local.
         $state = $this->log_state( $state, 'Exporting database.' );
@@ -390,18 +444,31 @@ class YAWP_Backup {
         return $state;
     }
 
+    /**
+     * Archive one batch of files as an independent gzip member on disk.
+     *
+     * Writes wp-content/yawp-tmp/<ts>/current/batch-NNNNN.tar.gz. When the
+     * cumulative size of fragments under current/ exceeds TARGET_PART_SIZE
+     * (or the file list is exhausted), transitions to close_part so the
+     * fragments get concatenated and uploaded.
+     */
     private function step_archive( $state ) {
         $cursor  = $state['file_cursor'];
         $count   = $state['file_count'];
         $webroot = $state['webroot'];
 
+        // File list exhausted — flush any remaining fragments, then finish.
         if ( $cursor >= $count ) {
-            $state['step'] = 'finish';
-            $state = $this->log_state( $state, 'All files archived and uploaded.' );
+            if ( $state['current_part_size'] > 0 ) {
+                $state['step'] = 'close_part';
+                $state = $this->log_state( $state, 'All files staged — closing final part.' );
+            } else {
+                $state['step'] = 'finish';
+                $state = $this->log_state( $state, 'All files archived and uploaded.' );
+            }
             return $state;
         }
 
-        // Read only this batch's chunk from wp_options (not the entire file list).
         $chunk_index = intdiv( $cursor, self::BATCH_SIZE );
         $raw = get_option( self::FILE_LIST_KEY . '_' . $chunk_index, '' );
         if ( empty( $raw ) ) {
@@ -413,83 +480,201 @@ class YAWP_Backup {
         }
 
         $batch_end = min( $cursor + count( $batch ), $count );
-
-        // Build tar in memory (no PharData — it corrupts on IONOS shared hosting).
-        $part_num = $state['part_num'] + 1;
+        $seq       = $state['batch_seq'] + 1;
+        $frag_path = $state['staging_dir'] . '/current/' . sprintf( 'batch-%05d.tar.gz', $seq );
 
         try {
-            $tar_data = '';
-            $added    = 0;
-            $skipped  = 0;
+            $gz = @gzopen( $frag_path, 'wb6' );
+            if ( ! $gz ) {
+                return $this->fail_state( $state, 'Could not open fragment for writing: ' . $frag_path );
+            }
+
+            $added   = 0;
+            $skipped = 0;
 
             foreach ( $batch as $rel_path ) {
                 $full_path = $webroot . '/' . $rel_path;
                 if ( ! is_file( $full_path ) || ! is_readable( $full_path ) ) {
+                    $this->record_skip( $state, $rel_path, 'unreadable' );
+                    $skipped++;
                     continue;
                 }
                 $fsize = @filesize( $full_path );
-                if ( false === $fsize || $fsize > self::MAX_FILE_SIZE ) {
+                if ( false === $fsize ) {
+                    $this->record_skip( $state, $rel_path, 'filesize-failed' );
                     $skipped++;
                     continue;
                 }
-                $contents = @file_get_contents( $full_path );
-                if ( false === $contents ) {
+                $ok = $this->write_tar_file_to_gz( $gz, $rel_path, $full_path, (int) $fsize );
+                if ( ! $ok ) {
+                    $this->record_skip( $state, $rel_path, 'path-too-long' );
                     $skipped++;
                     continue;
                 }
-                $entry = $this->tar_entry( $rel_path, $contents );
-                unset( $contents );
-                if ( '' === $entry ) {
-                    $skipped++; // Path too long for ustar.
-                    continue;
-                }
-                $tar_data .= $entry;
                 $added++;
             }
 
+            gzclose( $gz );
+
+            $state['skipped_count'] = ( $state['skipped_count'] ?? 0 ) + $skipped;
+
             if ( 0 === $added ) {
+                // All skipped — drop the empty fragment and advance cursor.
+                @unlink( $frag_path );
                 $state['file_cursor'] = $batch_end;
-                $state = $this->log_state( $state, "Batch {$cursor}-{$batch_end}: 0 files (all skipped, {$skipped} oversize/unreadable)." );
+                $state = $this->log_state( $state, "Batch {$cursor}-{$batch_end}: 0 files (all {$skipped} skipped)." );
                 return $state;
             }
 
-            // Two 512-byte null blocks = end-of-archive marker.
-            $tar_data .= pack( 'a1024', '' );
+            $frag_size                   = (int) @filesize( $frag_path );
+            $state['file_cursor']        = $batch_end;
+            $state['batch_seq']          = $seq;
+            $state['current_part_size'] += $frag_size;
 
-            $gz_data = gzencode( $tar_data, 6 );
-            unset( $tar_data );
+            $state = $this->log_state( $state, sprintf(
+                'Staged batch %d: files %d-%d (%d added%s, %s — part %d now %s).',
+                $seq,
+                $cursor,
+                $batch_end,
+                $added,
+                $skipped > 0 ? ", {$skipped} skipped" : '',
+                size_format( $frag_size ),
+                $state['part_num'] + 1,
+                size_format( $state['current_part_size'] )
+            ) );
 
-            if ( false === $gz_data ) {
-                return $this->fail_state( $state, "Compression failed for batch starting at {$cursor}." );
+            // Close the part if we've hit the size threshold or drained
+            // the file list.
+            if ( $state['current_part_size'] >= self::TARGET_PART_SIZE || $state['file_cursor'] >= $count ) {
+                $state['step'] = 'close_part';
             }
 
-            $gz_path = tempnam( sys_get_temp_dir(), 'yawp-gz-' );
-            file_put_contents( $gz_path, $gz_data );
-            $part_size = strlen( $gz_data );
-            unset( $gz_data );
+        } catch ( \Throwable $e ) {
+            @unlink( $frag_path );
+            return $this->fail_state( $state, 'Archive step exception: ' . $e->getMessage() );
+        }
 
-            // Upload this part to S3.
+        return $state;
+    }
+
+    /**
+     * Concatenate all batch-*.tar.gz fragments under current/ into one
+     * part-NNNN.tar.gz, append the tar EOF marker as a final gzip member,
+     * upload via multipart S3, delete the local copy. Fragments form a
+     * valid gzip file by concatenation (RFC 1952 §2.2).
+     */
+    private function step_close_part( $state ) {
+        $part_num   = $state['part_num'] + 1;
+        $current    = $state['staging_dir'] . '/current';
+        $part_path  = $state['staging_dir'] . '/' . sprintf( 'part-%04d.tar.gz', $part_num );
+
+        $fragments = glob( $current . '/batch-*.tar.gz' );
+        if ( false === $fragments || empty( $fragments ) ) {
+            // Nothing to do — shouldn't happen, but recover gracefully.
+            $state['step'] = $state['file_cursor'] >= $state['file_count'] ? 'finish' : 'archive';
+            $state = $this->log_state( $state, 'close_part: no fragments present, skipping.' );
+            return $state;
+        }
+        sort( $fragments, SORT_STRING );
+
+        // Remove any stale output from a prior crashed close_part.
+        if ( file_exists( $part_path ) ) {
+            @unlink( $part_path );
+        }
+
+        try {
+            $out = @fopen( $part_path, 'wb' );
+            if ( ! $out ) {
+                return $this->fail_state( $state, 'Could not open part file: ' . $part_path );
+            }
+
+            foreach ( $fragments as $frag ) {
+                $in = @fopen( $frag, 'rb' );
+                if ( ! $in ) {
+                    fclose( $out );
+                    @unlink( $part_path );
+                    return $this->fail_state( $state, 'Could not read fragment: ' . $frag );
+                }
+                while ( ! feof( $in ) ) {
+                    $chunk = fread( $in, self::FREAD_CHUNK );
+                    if ( false === $chunk || '' === $chunk ) {
+                        break;
+                    }
+                    if ( false === fwrite( $out, $chunk ) ) {
+                        fclose( $in );
+                        fclose( $out );
+                        @unlink( $part_path );
+                        return $this->fail_state( $state, 'Write failed concatenating ' . basename( $frag ) );
+                    }
+                }
+                fclose( $in );
+            }
+
+            // Append the tar EOF marker (1024 null bytes) as its own gzip
+            // member. Generate via gzopen to a throwaway file and append.
+            $eof_path = $current . '/_eof.gz';
+            $eg       = @gzopen( $eof_path, 'wb6' );
+            if ( ! $eg ) {
+                fclose( $out );
+                @unlink( $part_path );
+                return $this->fail_state( $state, 'Could not build EOF marker.' );
+            }
+            gzwrite( $eg, pack( 'a1024', '' ) );
+            gzclose( $eg );
+            $eg_in = @fopen( $eof_path, 'rb' );
+            if ( $eg_in ) {
+                while ( ! feof( $eg_in ) ) {
+                    $chunk = fread( $eg_in, self::FREAD_CHUNK );
+                    if ( false === $chunk || '' === $chunk ) {
+                        break;
+                    }
+                    fwrite( $out, $chunk );
+                }
+                fclose( $eg_in );
+            }
+            @unlink( $eof_path );
+
+            fclose( $out );
+
+            $part_size = (int) @filesize( $part_path );
+            if ( $part_size <= 0 ) {
+                return $this->fail_state( $state, 'Part file is empty after concat: ' . $part_path );
+            }
+
             $s3 = $this->get_s3();
             if ( is_wp_error( $s3 ) ) {
-                @unlink( $gz_path );
+                @unlink( $part_path );
                 return $this->fail_state( $state, $s3->get_error_message() );
             }
 
             $part_key = sprintf( '%s/part-%04d.tar.gz', $state['s3_dir'], $part_num );
-            $upload   = $s3->stream_upload( $part_key, $gz_path, self::RETENTION_DAYS );
-            @unlink( $gz_path );
-
+            $upload   = $s3->stream_upload( $part_key, $part_path, self::RETENTION_DAYS );
+            @unlink( $part_path );
             if ( is_wp_error( $upload ) ) {
                 return $this->fail_state( $state, 'Upload failed for part ' . $part_num . ': ' . $upload->get_error_message() );
             }
 
-            $state['file_cursor'] = $batch_end;
-            $state['part_num']    = $part_num;
-            $state['total_size'] += $part_size;
-            $state = $this->log_state( $state, "Part {$part_num}: files {$cursor}-{$batch_end} ({$added} added, " . size_format( $part_size ) . ').' );
+            // Clean up the fragments now that they're durably in S3.
+            foreach ( $fragments as $frag ) {
+                @unlink( $frag );
+            }
+
+            $state['part_num']          = $part_num;
+            $state['batch_seq']         = 0;
+            $state['current_part_size'] = 0;
+            $state['total_size']       += $part_size;
+            $state = $this->log_state( $state, sprintf(
+                'Uploaded part %d (%s, %d fragments).',
+                $part_num,
+                size_format( $part_size ),
+                count( $fragments )
+            ) );
+
+            $state['step'] = $state['file_cursor'] >= $state['file_count'] ? 'finish' : 'archive';
 
         } catch ( \Throwable $e ) {
-            return $this->fail_state( $state, 'Archive step exception: ' . $e->getMessage() );
+            @unlink( $part_path );
+            return $this->fail_state( $state, 'Close-part exception: ' . $e->getMessage() );
         }
 
         return $state;
@@ -504,18 +689,32 @@ class YAWP_Backup {
             $parts[] = sprintf( '%s/part-%04d.tar.gz', $state['s3_dir'], $i );
         }
 
+        $skipped_count  = (int) ( $state['skipped_count'] ?? 0 );
+        $archived_count = max( 0, (int) $state['file_count'] - $skipped_count );
+
         $manifest = [
-            'version'    => 2,
-            'type'       => $state['type'],
-            'timestamp'  => $state['timestamp'],
-            'file_count' => $state['file_count'],
-            'part_count' => $state['part_num'],
-            'total_size' => $state['total_size'],
-            'database'   => $state['s3_dir'] . '/database.sql',
-            'parts'      => $parts,
+            'version'        => 2,
+            'type'           => $state['type'],
+            'timestamp'      => $state['timestamp'],
+            'file_count'     => $state['file_count'],
+            'archived_count' => $archived_count,
+            'skipped_count'  => $skipped_count,
+            'part_count'     => $state['part_num'],
+            'total_size'     => $state['total_size'],
+            'database'       => $state['s3_dir'] . '/database.sql.gz',
+            'parts'          => $parts,
         ];
+        if ( $skipped_count > 0 ) {
+            $manifest['skipped_log'] = $state['s3_dir'] . '/skipped.txt';
+        }
 
         if ( ! is_wp_error( $s3 ) ) {
+            // Upload skipped log first so the manifest's reference is valid.
+            $skipped_path = ! empty( $state['staging_dir'] ) ? $state['staging_dir'] . '/skipped.txt' : '';
+            if ( $skipped_path && is_file( $skipped_path ) && @filesize( $skipped_path ) > 0 ) {
+                $s3->stream_upload( $state['s3_dir'] . '/skipped.txt', $skipped_path, self::RETENTION_DAYS );
+            }
+
             // Upload backup manifest.
             $manifest_key = $state['s3_dir'] . '/manifest.json';
             $s3->put_text( $manifest_key, wp_json_encode( $manifest, JSON_PRETTY_PRINT ) );
@@ -556,8 +755,19 @@ class YAWP_Backup {
         // Clean up file list chunks from wp_options.
         self::delete_file_list_chunks();
 
-        $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully (' . $state['part_num'] . ' parts, ' . size_format( $state['total_size'] ) . ').' );
-        yawp_log( 'info', 'Backup completed', [ 'type' => $state['type'], 'parts' => $state['part_num'], 'size' => $state['total_size'] ] );
+        // Remove the staging directory — everything is durably in S3 now.
+        if ( ! empty( $state['staging_dir'] ) ) {
+            self::rrmdir( $state['staging_dir'] );
+        }
+
+        $skipped_suffix = $skipped_count > 0 ? ", {$skipped_count} files skipped" : '';
+        $state = $this->log_state( $state, ucfirst( $state['type'] ) . ' backup completed successfully (' . $state['part_num'] . ' parts, ' . size_format( $state['total_size'] ) . $skipped_suffix . ').' );
+        yawp_log( 'info', 'Backup completed', [
+            'type'    => $state['type'],
+            'parts'   => $state['part_num'],
+            'size'    => $state['total_size'],
+            'skipped' => $skipped_count,
+        ] );
         $this->healthcheck( 'success', $state['log'] );
 
         delete_transient( self::LOCK_KEY );
@@ -610,8 +820,24 @@ class YAWP_Backup {
             'status' => $message,
         ]);
 
+        // Best-effort: upload the skipped log before nuking the staging dir
+        // so partial-run evidence survives. Silent on any S3 error — this
+        // is already a failure path.
+        if ( ! empty( $state['staging_dir'] ) && ! empty( $state['s3_dir'] ) ) {
+            $skipped_path = $state['staging_dir'] . '/skipped.txt';
+            if ( is_file( $skipped_path ) && @filesize( $skipped_path ) > 0 ) {
+                $s3 = $this->get_s3();
+                if ( ! is_wp_error( $s3 ) ) {
+                    $s3->stream_upload( $state['s3_dir'] . '/skipped.txt', $skipped_path, self::RETENTION_DAYS );
+                }
+            }
+        }
+
         // Clean up.
         self::delete_file_list_chunks();
+        if ( ! empty( $state['staging_dir'] ) ) {
+            self::rrmdir( $state['staging_dir'] );
+        }
         delete_transient( self::LOCK_KEY );
 
         return $state;
@@ -622,30 +848,23 @@ class YAWP_Backup {
     // ──────────────────────────────────────────────
 
     /**
-     * Build a single POSIX/ustar tar entry (header + data) in memory.
+     * Build a 512-byte POSIX/ustar tar header for a regular file.
      *
-     * Returns a binary string that can be concatenated to form a valid tar.
-     * No temp files, no PharData — immune to IONOS temp-dir corruption.
+     * Returns the header bytes, or '' if the path is too long for ustar
+     * (prefix 155 + name 100 = 255 chars max, with split on a '/' boundary).
      */
-    private function tar_entry( $name, $data ) {
-        $size = strlen( $data );
-
-        // ustar supports prefix (155) + name (100) = 255 chars max.
-        // Split long paths at a '/' boundary into prefix + name.
+    private function tar_header( $name, $size ) {
         $prefix = '';
         if ( strlen( $name ) > 100 ) {
-            // Find last '/' that leaves name <= 100 and prefix <= 155.
             $split = strrpos( substr( $name, 0, strlen( $name ) - 1 ), '/' );
             if ( false !== $split && $split <= 155 && ( strlen( $name ) - $split - 1 ) <= 100 ) {
                 $prefix = substr( $name, 0, $split );
                 $name   = substr( $name, $split + 1 );
             } else {
-                // Path too long for ustar — skip this file.
                 return '';
             }
         }
 
-        // Tar header: 512 bytes, ustar format.
         $header = pack(
             'a100a8a8a8a12a12a8a1a100a6a2a32a32a8a8a155a12',
             $name,                          // name (100)
@@ -667,27 +886,200 @@ class YAWP_Backup {
             ''                              // padding (12)
         );
 
-        // Compute checksum: sum of all unsigned bytes, with checksum field as spaces.
         $checksum = 0;
         for ( $i = 0; $i < 512; $i++ ) {
             $checksum += ord( $header[ $i ] );
         }
         $checksum = sprintf( '%06o', $checksum ) . "\0 ";
-        $header   = substr_replace( $header, $checksum, 148, 8 );
+        return substr_replace( $header, $checksum, 148, 8 );
+    }
 
-        // Data padded to 512-byte boundary.
+    /**
+     * Null-padding to round a data payload of $size bytes up to the next
+     * 512-byte tar boundary.
+     */
+    private function tar_pad( $size ) {
         $padding = ( 512 - ( $size % 512 ) ) % 512;
+        return $padding > 0 ? pack( 'a' . $padding, '' ) : '';
+    }
 
-        return $header . $data . ( $padding > 0 ? pack( 'a' . $padding, '' ) : '' );
+    /**
+     * Stream a single file's tar entry (header + body + padding) into an
+     * open gzip handle. Peak memory is one FREAD_CHUNK plus zlib's window.
+     *
+     * Returns true on success, false if the path is too long for ustar or
+     * the file can't be opened. If the file's on-disk size changes during
+     * read, the declared header size wins: extra bytes are dropped, missing
+     * bytes are zero-padded, so the tar stays well-formed.
+     */
+    private function write_tar_file_to_gz( $gz, $rel_path, $full_path, $size ) {
+        $header = $this->tar_header( $rel_path, $size );
+        if ( '' === $header ) {
+            return false;
+        }
+        $fh = @fopen( $full_path, 'rb' );
+        if ( ! $fh ) {
+            return false;
+        }
+        gzwrite( $gz, $header );
+
+        $remaining = $size;
+        while ( $remaining > 0 ) {
+            $want  = $remaining < self::FREAD_CHUNK ? $remaining : self::FREAD_CHUNK;
+            $chunk = fread( $fh, $want );
+            if ( false === $chunk || '' === $chunk ) {
+                break;
+            }
+            gzwrite( $gz, $chunk );
+            $remaining -= strlen( $chunk );
+        }
+        fclose( $fh );
+
+        // File shrank mid-read? Zero-pad to declared size so the next tar
+        // header lands on the correct offset.
+        while ( $remaining > 0 ) {
+            $pad = $remaining < self::FREAD_CHUNK ? $remaining : self::FREAD_CHUNK;
+            gzwrite( $gz, str_repeat( "\0", $pad ) );
+            $remaining -= $pad;
+        }
+
+        gzwrite( $gz, $this->tar_pad( $size ) );
+        return true;
+    }
+
+    /**
+     * Append a single line to the staging skipped.txt log. Each line is
+     * tab-separated: <reason>\t<rel_path>. Uploaded to S3 alongside the
+     * manifest at finish so skips are evidenceable after the fact.
+     */
+    private function record_skip( $state, $rel_path, $reason ) {
+        if ( empty( $state['staging_dir'] ) ) {
+            return;
+        }
+        $line = $reason . "\t" . $rel_path . "\n";
+        @file_put_contents( $state['staging_dir'] . '/skipped.txt', $line, FILE_APPEND );
+    }
+
+    /**
+     * Root directory for on-disk staging. Each running backup owns a
+     * timestamped subdirectory here; see step_init() for creation and
+     * cancel()/fail_state()/step_finish() for cleanup.
+     */
+    private static function staging_root() {
+        return rtrim( WP_CONTENT_DIR, '/' ) . '/yawp-tmp';
+    }
+
+    /**
+     * Recursively delete a directory and everything below it. Used by
+     * cleanup paths. Silently tolerates already-gone files.
+     */
+    private static function rrmdir( $dir ) {
+        if ( ! is_dir( $dir ) ) {
+            return;
+        }
+        $items = @scandir( $dir );
+        if ( false === $items ) {
+            return;
+        }
+        foreach ( $items as $item ) {
+            if ( '.' === $item || '..' === $item ) {
+                continue;
+            }
+            $path = $dir . '/' . $item;
+            if ( is_dir( $path ) && ! is_link( $path ) ) {
+                self::rrmdir( $path );
+            } else {
+                @unlink( $path );
+            }
+        }
+        @rmdir( $dir );
+    }
+
+    /**
+     * Remove staging subdirectories older than LOCK_TTL. Called from
+     * start() — picks up after any backup that crashed without cleanup.
+     */
+    private static function sweep_orphan_staging() {
+        $root = self::staging_root();
+        if ( ! is_dir( $root ) ) {
+            return;
+        }
+        $cutoff = time() - self::LOCK_TTL;
+        $items  = @scandir( $root );
+        if ( false === $items ) {
+            return;
+        }
+        foreach ( $items as $item ) {
+            if ( '.' === $item || '..' === $item ) {
+                continue;
+            }
+            $path = $root . '/' . $item;
+            if ( is_dir( $path ) && ! is_link( $path ) ) {
+                $mtime = @filemtime( $path );
+                if ( false !== $mtime && $mtime < $cutoff ) {
+                    self::rrmdir( $path );
+                }
+            }
+        }
+    }
+
+    /**
+     * Create the timestamped staging directory and its guards. Returns
+     * the absolute path on success, or a WP_Error on failure.
+     */
+    private static function create_staging_dir( $timestamp ) {
+        $root = self::staging_root();
+        if ( ! wp_mkdir_p( $root ) ) {
+            return new WP_Error( 'yawp_backup', 'Could not create ' . $root );
+        }
+        // Guard the root — web-inaccessible even before any backup runs.
+        $htaccess = $root . '/.htaccess';
+        if ( ! file_exists( $htaccess ) ) {
+            @file_put_contents( $htaccess, "Order deny,allow\nDeny from all\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteRule .* - [F,L]\n</IfModule>\n" );
+        }
+        $index = $root . '/index.html';
+        if ( ! file_exists( $index ) ) {
+            @file_put_contents( $index, '' );
+        }
+
+        $dir = $root . '/' . $timestamp;
+        if ( ! wp_mkdir_p( $dir . '/current' ) ) {
+            return new WP_Error( 'yawp_backup', 'Could not create ' . $dir . '/current' );
+        }
+        return $dir;
     }
 
     private function is_excluded( $rel_path ) {
-        foreach ( self::$excludes as $exclude ) {
+        foreach ( $this->get_excludes() as $exclude ) {
             if ( $rel_path === $exclude || 0 === strpos( $rel_path, $exclude . '/' ) ) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Return the effective exclude list — built-ins plus any
+     * user-configured entries from the yawp_extra_excludes setting.
+     */
+    private function get_excludes() {
+        if ( null !== self::$combined_excludes ) {
+            return self::$combined_excludes;
+        }
+        $extra = get_option( 'yawp_extra_excludes', '' );
+        $user  = [];
+        if ( is_string( $extra ) && '' !== $extra ) {
+            foreach ( explode( ',', $extra ) as $item ) {
+                $item = trim( $item );
+                $item = trim( $item, "/\\" );
+                if ( '' === $item || false !== strpos( $item, '..' ) ) {
+                    continue;
+                }
+                $user[] = $item;
+            }
+        }
+        self::$combined_excludes = array_merge( self::$excludes, $user );
+        return self::$combined_excludes;
     }
 
     private function get_webroot() {
